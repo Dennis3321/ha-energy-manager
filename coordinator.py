@@ -1,4 +1,6 @@
+
 from __future__ import annotations
+import asyncio
 
 import json
 import logging
@@ -52,29 +54,31 @@ BATTERY_DEPRECIATION = DEFAULT_BATTERY_COST / (DEFAULT_BATTERY_CYCLES * DEFAULT_
 _WEEKDAYS_NL = ["ma", "di", "wo", "do", "vr", "za", "zo"]
 
 class BatteryManagerCoordinator(DataUpdateCoordinator):
-        def _get_dynamic_limits(self):
-            """Lees de actuele laad- en ontlaadlimieten uit de entiteiten (indien beschikbaar)."""
-            config = self.entry.data
-            charge_entity = config.get(CONF_BATTERY_CHARGE_LIMIT, "")
-            discharge_entity = config.get(CONF_BATTERY_DISCHARGE_LIMIT, "")
-            charge_limit = DEFAULT_BATTERY_MAX_CHARGE
-            discharge_limit = DEFAULT_BATTERY_MAX_DISCHARGE
-            # Probeer actuele waardes te lezen
-            if charge_entity:
-                state = self.hass.states.get(charge_entity)
-                if state and state.state not in ("unavailable", "unknown", "none", ""):
-                    try:
-                        charge_limit = float(state.state)
-                    except (ValueError, TypeError):
-                        pass
-            if discharge_entity:
-                state = self.hass.states.get(discharge_entity)
-                if state and state.state not in ("unavailable", "unknown", "none", ""):
-                    try:
-                        discharge_limit = float(state.state)
-                    except (ValueError, TypeError):
-                        pass
-            return charge_limit, discharge_limit
+
+    def _get_dynamic_limits(self):
+        """Lees de actuele laad- en ontlaadlimieten uit de entiteiten (indien beschikbaar)."""
+        config = self.entry.data
+        charge_entity = config.get(CONF_BATTERY_CHARGE_LIMIT, "")
+        discharge_entity = config.get(CONF_BATTERY_DISCHARGE_LIMIT, "")
+        charge_limit = DEFAULT_BATTERY_MAX_CHARGE
+        discharge_limit = DEFAULT_BATTERY_MAX_DISCHARGE
+        # Probeer actuele waardes te lezen
+        if charge_entity:
+            state = self.hass.states.get(charge_entity)
+            if state and state.state not in ("unavailable", "unknown", "none", ""):
+                try:
+                    charge_limit = float(state.state)
+                except (ValueError, TypeError):
+                    pass
+        if discharge_entity:
+            state = self.hass.states.get(discharge_entity)
+            if state and state.state not in ("unavailable", "unknown", "none", ""):
+                try:
+                    discharge_limit = float(state.state)
+                except (ValueError, TypeError):
+                    pass
+        return charge_limit, discharge_limit
+
     """Coordinator to manage battery data updates."""
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -217,12 +221,15 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         van de witte SOC-lijn op de 'nu'-grens.
         """
         action_by_idx = {s["quarter"]: s["action"] for s in schedule}
-        # Verleden-kwartieren hebben battery_soc=None in het schema
         is_future_by_idx = {s["quarter"]: s["battery_soc"] is not None for s in schedule}
         projected_soc: float | None = None
 
-        # Haal actuele limieten op voor projectie
+        # Debug: log het laadplan en start-SOC
+        _LOGGER.info("[BM] Laadplan voor chart: %s", [(s["quarter"], s["action"]) for s in schedule])
+        _LOGGER.info("[BM] Start-SOC voor projectie: %.2f%%", battery_soc)
+
         charge_limit, discharge_limit = self._get_dynamic_limits()
+        _LOGGER.info("[BM] Limieten voor projectie: charge=%dW, discharge=%dW", charge_limit, discharge_limit)
         chart = []
         for i, quarter in enumerate(all_prices):
             try:
@@ -252,11 +259,13 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             # Op het eerste toekomstige kwartier: initialiseer met de ECHTE huidige SOC
             if is_future and projected_soc is None:
                 projected_soc = battery_soc
+                _LOGGER.info("[BM] Projectie start bij kwartier %d met SOC %.2f%%", i, projected_soc)
 
             # SOC-projectie puur op grid-acties (zon speelt geen rol — terugleveren
             # bij hoge prijs is waardevoller dan accumuladen met zonne-energie).
             chart_soc: float | None = None
             if projected_soc is not None and is_future:
+                old_soc = projected_soc
                 if action_i in ("charge", "all_on"):
                     energy_added = (charge_limit / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
                     projected_soc = min(DEFAULT_MAX_SOC, projected_soc + (energy_added / DEFAULT_BATTERY_CAPACITY) * 100)
@@ -266,6 +275,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 else:
                     projected_soc = max(0.0, projected_soc - 0.05)
                 chart_soc = round(projected_soc, 1)
+                _LOGGER.info("[BM] Kwartier %d: actie=%s, SOC %.2f%% → %.2f%%", i, action_i, old_soc, projected_soc)
 
             if action_i in ("charge", "all_on"):
                 battery_flow_w = charge_limit

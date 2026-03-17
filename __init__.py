@@ -113,10 +113,23 @@ async def _async_update_lovelace_resource(hass: HomeAssistant, new_url: str) -> 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the Battery Manager component."""
+
     hass.data.setdefault(DOMAIN, {})
 
     # Stap 1: kopieer JS naar www (altijd, ook op herstart)
     await hass.async_add_executor_job(_deploy_frontend, hass)
+
+    # Stap 1b: voeg de resource toe via de officiële Home Assistant API (vanaf 2023.4+)
+    try:
+        from homeassistant.components.lovelace.resources import async_add_external_resource
+        www_dir = Path(hass.config.config_dir) / "www" / "battery_manager"
+        dst = www_dir / _JS_FILENAME
+        new_hash = await hass.async_add_executor_job(_file_hash, dst)
+        new_url = f"{_RESOURCE_URL_BASE}?v={new_hash}"
+        await async_add_external_resource(hass, new_url, "module")
+        _LOGGER.info("Battery Manager: Lovelace resource automatisch toegevoegd via API: %s", new_url)
+    except Exception as exc:
+        _LOGGER.warning("Battery Manager: kon Lovelace resource niet automatisch toevoegen via API: %s", exc)
 
     # Stap 2: update de in-memory Lovelace resource URL NADAT HA volledig is opgestart.
     # Zo overschrijft HA onze aanpassing niet (Lovelace schrijft in-memory state

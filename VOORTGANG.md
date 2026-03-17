@@ -26,7 +26,7 @@ Laatste update: 15 maart 2026
   - `normal` – standby
 - Extra arbitrage-cycli: zoekt rendabele koop/verkoop-paren buiten de vul-charge
 - Chronologische SOC-simulatie voorkomt dat ontladen de accu onder `min_soc` brengt
-  - `_build_chart_data()` – per-kwartier dataset: prijs (€/kWh), SOC-projectie (%)
+  - `_build_chart_data()` – per-kwartier dataset: prijs (€/kWh), SOC-projectie (%); uitgebreide debug-logging van laadplan en SOC-verloop in de HA logs
 - `_apply_battery_control()` – stuurt Zendure-batterij aan via select + number entiteiten
 - Live SOC-veiligheidscheck: ontladen geblokkeerd als actuele SOC ≤ `min_soc`
 - SOC-cache overleeft HA-herstart (`.storage/battery_manager_soc_cache.json`)

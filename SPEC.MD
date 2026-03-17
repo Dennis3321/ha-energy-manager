@@ -28,6 +28,7 @@ Deze integratie bestuurt een thuisbatterij volledig prijsgestuurd, zonder rekeni
 | Accu-levensduur        | 6000 cycli | Bepaalt afschrijving per kWh        |
 
 
+
 ## Plannerlogica
 
 De planner kijkt 48 uur vooruit en bepaalt per kwartier de optimale actie:
@@ -37,6 +38,11 @@ De planner kijkt 48 uur vooruit en bepaalt per kwartier de optimale actie:
 4. Ontlaadkwartieren: selecteer resterende kwartieren waarbij `prijs > break-even(koopprijs)`
 5. Chronologische check: simuleer SOC per kwartier; annuleer ontladen dat onder minimum SOC zou komen
 6. Live veiligheidscheck: als actuele SOC ≤ min_soc → ontladen geblokkeerd
+
+### Debugging en SOC-projectie
+- De SOC-projectie (witte lijn) wordt per kwartier gesimuleerd op basis van het laadplan en de ingestelde limieten.
+- In de Home Assistant logs wordt nu per kwartier gelogd: het laadplan, de start-SOC, de limieten, en voor elk kwartier de actie en SOC-verandering.
+- Dit maakt het eenvoudig te controleren of de projectie overeenkomt met het verwachte laadgedrag.
 
 
 | Actie        | AC Mode        | Laadlimiet | Ontlaadlimiet | Wanneer                |

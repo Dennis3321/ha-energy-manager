@@ -13,11 +13,10 @@ const CHART_JS_URL =
 
 // Background highlight colours per action
 const ACTION_COLORS = {
-  all_on:      "rgba(239, 68,  68,  0.15)", // rood   — gratis / negatieve prijs
-  charge:      "rgba(34,  197, 94,  0.15)", // groen  — goedkoop, laden
-  discharge:   "rgba(249, 115, 22,  0.15)", // oranje — duur, ontladen
-  heatpump_on: "rgba(139, 92,  246, 0.12)", // paars  — warmtepomp aan
-  forced_off:  "rgba(107, 114, 128, 0.10)", // grijs  — vakantie / uit
+  all_on:      "rgba(239, 68,  68,  0.10)", // neutraal rood
+  charge:      "rgba(34,  197, 94,  0.10)", // neutraal groen
+  discharge:   "rgba(249, 115, 22,  0.10)", // neutraal oranje
+  forced_off:  "rgba(107, 114, 128, 0.08)", // neutraal grijs
   normal:      "rgba(0,   0,   0,   0)",
 };
 
@@ -181,11 +180,11 @@ class BatteryDashboardCard extends HTMLElement {
           </div>
           <div class="li">
             <div class="dot" style="background:rgba(255,255,255,0.8);border-radius:50%;"></div>
-            <span>Accu SOC – voorspelling (%)</span>
+            <span>Accu SOC (%)</span>
           </div>
           <div class="li">
             <div class="dot" style="background:rgba(250,204,21,0.7);border-radius:2px;"></div>
-            <span>Cumulatieve besparing (€)</span>
+            <span>Besparing (€)</span>
           </div>
         </div>
       </ha-card>
@@ -224,7 +223,25 @@ class BatteryDashboardCard extends HTMLElement {
     const canvas = this.shadowRoot.getElementById("chart");
     if (!canvas) return;
     if (this._chart) { this._chart.destroy(); this._chart = null; }
-    this._chart = new Chart(canvas, this._buildChartConfig(data));
+    try {
+      // Defensive: if data is missing or malformed, show a message and skip rendering
+      if (!Array.isArray(data) || data.length === 0) {
+        this._showMessage("Nog geen data beschikbaar — wacht op de eerste update.");
+        return;
+      }
+      // Defensive: check for required fields in at least one data point
+      const hasValid = data.some(d => d && typeof d === 'object' && 'price' in d && 'time' in d);
+      if (!hasValid) {
+        this._showMessage("Dataformaat ongeldig — controleer sensor output.");
+        return;
+      }
+      this._chart = new Chart(canvas, this._buildChartConfig(data));
+    } catch (err) {
+      this._showMessage("Fout bij tekenen grafiek: " + (err?.message || err));
+    }
+    // Always enable fullscreen button, even if chart is empty
+    const expandBtn = this.shadowRoot.getElementById("expand-btn");
+    if (expandBtn) expandBtn.disabled = false;
   }
 
   // ── Chart config builder (shared between card and fullscreen modal) ───────
