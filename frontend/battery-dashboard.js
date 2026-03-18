@@ -336,7 +336,7 @@ class BatteryDashboardCard extends HTMLElement {
         labels,
         datasets: [
           {
-            // ── Prijs ── right axis, line
+            // ── Prijs ── right axis, stepped line (prijs per kwartier)
             type: "line",
             label: "Prijs",
             data: prices,
@@ -344,6 +344,7 @@ class BatteryDashboardCard extends HTMLElement {
             borderColor: "#86efac",
             backgroundColor: "rgba(134,239,172,0.06)",
             fill: true,
+            stepped: "before",
             tension: 0,
             pointRadius: 0,
             borderWidth: 2,

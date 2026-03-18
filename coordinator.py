@@ -35,7 +35,24 @@ except Exception:
     pass
 
 TIBBER_API_URL = "https://api.tibber.com/v1-beta/gql"
-TIBBER_PRICE_QUERY = """{
+
+# Kwartierprijzen: resolution op priceInfo zelf (sinds 2025-09-01)
+# Geeft 96 slots per dag i.p.v. 24
+TIBBER_QUARTERLY_QUERY = """{
+  viewer {
+    homes {
+      currentSubscription {
+        priceInfo(resolution: QUARTER_HOURLY) {
+          today { startsAt total energy tax }
+          tomorrow { startsAt total energy tax }
+        }
+      }
+    }
+  }
+}"""
+
+# Fallback: uurprijzen (als QUARTER_HOURLY niet lukt)
+TIBBER_HOURLY_QUERY = """{
   viewer {
     homes {
       currentSubscription {
@@ -109,11 +126,11 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         try:
             config = self.entry.data
 
-            # Fetch prices directly from Tibber API
+            # ── Prijzen ophalen via Tibber (kwartierprijzen, fallback uurprijzen) ──
             prices_today, prices_tomorrow = await self._fetch_tibber_prices(
                 config[CONF_TIBBER_TOKEN]
             )
-            self._dbg("Tibber: %d prijzen vandaag, %d morgen",
+            self._dbg("Prijzen: %d vandaag, %d morgen",
                       len(prices_today), len(prices_tomorrow))
 
             # Laad SOC-cache bij eerste update (mag niet in __init__ — blocking I/O)
@@ -308,10 +325,28 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
 
         return chart
 
-    def _expand_to_quarters(self, hourly_prices: list) -> list:
-        """Fallback: expand hourly slots into 4 × 15-minute quarter slots (flat price)."""
+    def _ensure_quarters(self, prices: list) -> list:
+        """Return quarter-hourly price list.
+
+        If the data is already per-quarter (≤ 15 min between first two slots),
+        return as-is.  Otherwise expand each hourly slot into 4 × 15-min copies.
+        """
+        if len(prices) >= 2:
+            try:
+                t0 = datetime.fromisoformat(prices[0]["startsAt"])
+                t1 = datetime.fromisoformat(prices[1]["startsAt"])
+                gap = (t1 - t0).total_seconds()
+                self._dbg("Tijdstap tussen eerste twee slots: %.0f s (%d min)", gap, gap / 60)
+                if gap <= 900:  # 15 min of minder → al kwartierdata
+                    _LOGGER.info("battery_manager: Tibber levert al kwartierdata (%d slots)", len(prices))
+                    return prices
+            except (ValueError, TypeError, KeyError):
+                pass
+        # Fallback: expand hourly slots into 4 × 15-minute quarter slots
+        _LOGGER.info("battery_manager: Tibber levert uurdata — expand naar kwartieren (%d → %d)",
+                     len(prices), len(prices) * 4)
         quarters = []
-        for slot in hourly_prices:
+        for slot in prices:
             starts_at_raw = slot.get("startsAt", "")
             try:
                 dt = datetime.fromisoformat(
@@ -397,41 +432,77 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             return default
 
     async def _fetch_tibber_prices(self, token: str) -> tuple[list, list]:
-        """Fetch today and tomorrow hourly prices from Tibber GraphQL API."""
+        """Fetch prices from Tibber — try quarter-hourly first, fall back to hourly."""
         session = async_get_clientsession(self.hass)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+
+        # ── Poging 1: kwartierprijzen via priceInfo(resolution: QUARTER_HOURLY) ──
         try:
-            self._dbg("Tibber API: verbinding maken met %s", TIBBER_API_URL)
+            self._dbg("Tibber API: kwartierprijzen ophalen")
             async with session.post(
                 TIBBER_API_URL,
-                json={"query": TIBBER_PRICE_QUERY},
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
+                json={"query": TIBBER_QUARTERLY_QUERY},
+                headers=headers,
                 timeout=10,
             ) as resp:
-                self._dbg("Tibber API: HTTP status %s", resp.status)
                 data = await resp.json()
 
-            homes = data["data"]["viewer"]["homes"]
-            self._dbg("Tibber API: %d home(s) gevonden", len(homes))
-            for home in homes:
-                price_info = (
-                    home.get("currentSubscription") or {}
-                ).get("priceInfo") or {}
-                today    = price_info.get("today")    or []
-                tomorrow = price_info.get("tomorrow") or []
-                self._dbg("Tibber API home: today=%d uur, tomorrow=%d uur",
-                          len(today), len(tomorrow))
+            if "errors" not in data:
+                today, tomorrow = self._extract_today_tomorrow(data)
                 if today:
-                    # Tibber geeft uurprijzen; verdubbel elk uur naar 4 kwartieren
-                    return self._expand_to_quarters(today), self._expand_to_quarters(tomorrow)
-            _LOGGER.warning("battery_manager: Tibber API gaf geen 'today' prijzen terug — respons: %s",
-                            str(data)[:300])
+                    _LOGGER.info(
+                        "battery_manager: Tibber kwartierprijzen: %d vandaag, %d morgen",
+                        len(today), len(tomorrow)
+                    )
+                    return today, tomorrow
+            else:
+                _LOGGER.warning(
+                    "battery_manager: Tibber QUARTER_HOURLY niet beschikbaar: %s — fallback naar uurprijzen",
+                    data["errors"][0].get("message", "?")[:120]
+                )
+        except Exception as err:
+            _LOGGER.warning("battery_manager: Tibber kwartierprijzen mislukt: %s — fallback", err)
+
+        # ── Poging 2: uurprijzen + expansie naar kwartieren ──
+        try:
+            self._dbg("Tibber API: uurprijzen ophalen (fallback)")
+            async with session.post(
+                TIBBER_API_URL,
+                json={"query": TIBBER_HOURLY_QUERY},
+                headers=headers,
+                timeout=10,
+            ) as resp:
+                data = await resp.json()
+
+            today, tomorrow = self._extract_today_tomorrow(data)
+            if today:
+                _LOGGER.info(
+                    "battery_manager: Tibber uurprijzen: %d vandaag, %d morgen (expand naar kwartieren)",
+                    len(today), len(tomorrow)
+                )
+                return self._ensure_quarters(today), self._ensure_quarters(tomorrow)
+            _LOGGER.warning("battery_manager: Tibber API gaf geen prijzen terug")
             return [], []
         except Exception as err:
             _LOGGER.warning("battery_manager: Tibber API error: %s", err)
             return [], []
+
+    @staticmethod
+    def _extract_today_tomorrow(data: dict) -> tuple[list, list]:
+        """Extract today/tomorrow price lists from a Tibber API response."""
+        homes = data.get("data", {}).get("viewer", {}).get("homes") or []
+        for home in homes:
+            price_info = (
+                home.get("currentSubscription") or {}
+            ).get("priceInfo") or {}
+            today    = price_info.get("today")    or []
+            tomorrow = price_info.get("tomorrow") or []
+            if today:
+                return today, tomorrow
+        return [], []
 
     def _find_current_action(self, schedule: list) -> dict:
         """Zoek het kwartier dat nu actief is en geef het volledige slot terug."""

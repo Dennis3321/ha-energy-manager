@@ -52,6 +52,26 @@
 
 ---
 
+### RCA-9 — Grafiek toont prijzen per uur i.p.v. per kwartier
+- **Oorzaak (sessie 18 maart 2026):** De Tibber API levert standaard uurprijzen (24 per dag). Sinds 1 oktober 2025 ondersteunt de EPEX day-ahead markt kwartierprijzen (96 per dag). Tibber biedt deze aan via een opt-in `resolution` parameter, maar de integratie gebruikte de standaard query zonder dit argument.
+- **Symptoom:** Grafiek toont 4 identieke prijzen per uur → prijslijn verandert alleen per uur, niet per kwartier.
+- **Tibber API wijziging (sept 2025):** `priceInfo` accepteert nu `resolution: QUARTER_HOURLY` als argument. Zie https://developer.tibber.com/docs/changelog (entry 2025-09-01).
+- **Foutieve aanpak 1:** `range(resolution: QUARTER_HOURLY)` → `QUARTER_HOURLY` bestaat niet in de `PriceResolution` enum van het `range` veld.
+- **Foutieve aanpak 2:** Externe prijsentiteit (ENTSO-E) → onnodig complex, Tibber ondersteunt het zelf.
+- **Correcte query:**
+  ```graphql
+  priceInfo(resolution: QUARTER_HOURLY) {
+    today { startsAt total energy tax }
+    tomorrow { startsAt total energy tax }
+  }
+  ```
+- **Fix:** `coordinator.py` — `TIBBER_QUARTERLY_QUERY` aangepast: `resolution` parameter op `priceInfo` zelf, niet op `range`. Fallback naar uurprijzen + expansie als `QUARTER_HOURLY` niet beschikbaar is.
+- **Frontend:** `battery-dashboard.js` — prijslijn gebruikt `stepped: "before"` zodat prijssprongen als trapjes worden weergegeven i.p.v. diagonale overgangen.
+- **Log bij succes:** `battery_manager: Tibber kwartierprijzen: 96 vandaag, X morgen`
+- **Log bij fallback:** `battery_manager: Tibber QUARTER_HOURLY niet beschikbaar: ... — fallback naar uurprijzen`
+
+---
+
 ### RCA-8 — Firmware-update: maximum laad/ontlaadsnelheid verlaagd naar 800W
 - **Oorzaak (maart 2026):** Zendure firmware-update heeft het maximum van 2400W naar 800W verlaagd. De software stuurde 2400W — de firmware accepteerde dit commando maar beperkte de werkelijke output stil.
 - **Log (nieuw, na fix):** `battery_manager: laadlimiet BEPERKT door firmware — gevraagd=2400W, werkelijk=800W (firmware-maximum overschreden? Pas DEFAULT_BATTERY_MAX_CHARGE aan in const.py)`
@@ -137,6 +157,7 @@ Herstart HA daarna. Dit maakt ook de `[EM-DEBUG]`-berichten zichtbaar (dezelfde 
 | 13 mrt 2026 | 6 | Accu ontlaadt niet bij SOC ~99% en avondprijzen €0.33 | Deadlock drempelberekening (RCA-4) | Zonne-drempel override bij SOC ≥ 85% |
 | 7 mrt 2026 | 5 | Verbeterde logging toegevoegd voor diagnose | n.v.t. | WARNING-logs bij actiewijziging en blokkering |
 | 15 mrt 2026 | huidig | Batterij laadt én ontlaadt niet | Onbekend — voer diagnosestappen uit | Zie boven |
+| 18 mrt 2026 | huidig | Grafiek toont prijzen per uur i.p.v. kwartier | Tibber API standaard uurprijzen (RCA-9) | `priceInfo(resolution: QUARTER_HOURLY)` query |
 
 ---
 

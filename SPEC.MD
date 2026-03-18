@@ -58,6 +58,23 @@ De planner kijkt 48 uur vooruit en bepaalt per kwartier de optimale actie:
 
 
 
+## Prijsdata
+
+De integratie haalt stroomprijzen op via de Tibber GraphQL API (`https://api.tibber.com/v1-beta/gql`).
+
+### Kwartierprijzen (standaard sinds okt 2025)
+Sinds 1 oktober 2025 levert de EPEX day-ahead markt kwartierprijzen (96 per dag). De Tibber API ondersteunt dit via een `resolution` parameter op `priceInfo`:
+```graphql
+priceInfo(resolution: QUARTER_HOURLY) {
+  today { startsAt total energy tax }
+  tomorrow { startsAt total energy tax }
+}
+```
+- De integratie probeert **altijd eerst** kwartierprijzen op te halen.
+- **Fallback:** Als `QUARTER_HOURLY` niet beschikbaar is (foutmelding van Tibber), wordt teruggevallen op uurprijzen die vervolgens geëxpandeerd worden naar 4 × 15-minuten kwartieren met dezelfde prijs.
+- Bron: https://developer.tibber.com/docs/changelog (entry 2025-09-01)
+
+
 ## Regels
 1. Prijs is de enige motivatie voor laad- en ontlaadbeslissingen. Houd rekening met afschrijving en efficiëntie.
 2. Vóór een negatieve-prijsperiode moet de accu zo leeg mogelijk zijn zodat er maximaal geladen kan worden.
