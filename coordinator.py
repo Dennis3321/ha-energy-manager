@@ -245,7 +245,10 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         _LOGGER.info("[BM] Laadplan voor chart: %s", [(s["quarter"], s["action"]) for s in schedule])
         _LOGGER.info("[BM] Start-SOC voor projectie: %.2f%%", battery_soc)
 
-        charge_limit, discharge_limit = self._get_dynamic_limits()
+        # Gebruik DEFAULT limieten voor projectie — de live entity-waarden
+        # reflecteren de HUIDIGE actie (bv. 0W bij 'normal'), niet de toekomstige.
+        charge_limit = DEFAULT_BATTERY_MAX_CHARGE
+        discharge_limit = DEFAULT_BATTERY_MAX_DISCHARGE
         _LOGGER.info("[BM] Limieten voor projectie: charge=%dW, discharge=%dW", charge_limit, discharge_limit)
         chart = []
         for i, quarter in enumerate(all_prices):
@@ -531,10 +534,19 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         """Stuur de Zendure-batterij aan op basis van het huidige kwartier.
 
         Entiteiten (geconfigureerd in de config-flow):
-          select  CONF_BATTERY_MODE          AC Input Mode / AC Output Mode
-          number  CONF_BATTERY_CHARGE_LIMIT  0-800 W
-          number  CONF_BATTERY_DISCHARGE_LIMIT 0-800 W
+            select  CONF_BATTERY_MODE          AC Input Mode / AC Output Mode
+            number  CONF_BATTERY_CHARGE_LIMIT  0-800 W
+            number  CONF_BATTERY_DISCHARGE_LIMIT 0-800 W
         """
+        # Altijd loggen dat deze functie wordt aangeroepen, met context
+        try:
+            soc_entity = self.entry.data.get('battery_soc', 'onbekend')
+        except Exception:
+            soc_entity = 'onbekend'
+        _LOGGER.info(
+            "[BM-TRACE] _apply_battery_control aangeroepen: tijd=%s, soc_entity=%s, schedule_len=%d",
+            datetime.now().isoformat(timespec='seconds'), soc_entity, len(schedule) if schedule else 0
+        )
         config = self.entry.data
         if not config.get(CONF_MANAGE_BATTERY, False):
             _LOGGER.warning("battery_manager: batterijsturing uitgeschakeld (CONF_MANAGE_BATTERY=False)")
@@ -588,16 +600,18 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 self._last_applied_action, action, slot_time, price_str,
             )
 
-        # Bepaal doelstatus per actie, met dynamische limieten
-        dyn_charge_limit, dyn_discharge_limit = self._get_dynamic_limits()
+        # Bepaal doelstatus per actie — gebruik altijd de DEFAULT limieten.
+        # _get_dynamic_limits() leest de huidige entity-waarden, maar die
+        # reflecteren de VORIGE actie (bv. 0W bij 'normal') en niet wat we
+        # nu willen instellen.
         if action in ("charge", "all_on"):
             mode_option    = "input"
-            charge_limit   = dyn_charge_limit
+            charge_limit   = DEFAULT_BATTERY_MAX_CHARGE
             discharge_limit = 0
         elif action == "discharge":
             mode_option    = "output"
             charge_limit   = 0
-            discharge_limit = dyn_discharge_limit
+            discharge_limit = DEFAULT_BATTERY_MAX_DISCHARGE
         else:
             mode_option    = "input"
             charge_limit   = 0
@@ -958,7 +972,15 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             / (DEFAULT_CHARGE_EFFICIENCY ** 2)
         )
 
-        # ...verwijderd: zonne-drempel/solar-logica...
+        # Zonne-drempel override (RCA-4): als de accu al (bijna) vol is,
+        # is de opgeslagen energie gratis (zon/eerder geladen). De drempel
+        # hoeft dan alleen de afschrijving te dekken, niet de terugkoopprijs.
+        if battery_soc >= 85:
+            discharge_threshold = BATTERY_DEPRECIATION / DEFAULT_CHARGE_EFFICIENCY
+            self._dbg(
+                "Planner: zonne-drempel actief (SOC=%.0f%% ≥ 85%%) → drempel=€%.4f",
+                battery_soc, discharge_threshold,
+            )
 
         total_charge_quarters = sum(1 for e in future if e['action'] in ('charge', 'all_on'))
         estimated_peak_soc = min(DEFAULT_MAX_SOC, battery_soc + total_charge_quarters * soc_per_charge_quarter)

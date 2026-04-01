@@ -118,6 +118,18 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
 
     # Stap 1: kopieer JS naar www (altijd, ook op herstart)
     await hass.async_add_executor_job(_deploy_frontend, hass)
+    # Fallback: forceer toevoegen resource als hij ontbreekt
+    try:
+        from homeassistant.components.lovelace.resources import async_add_external_resource
+        www_dir = Path(hass.config.config_dir) / "www" / "battery_manager"
+        dst = www_dir / _JS_FILENAME
+        new_hash = await hass.async_add_executor_job(_file_hash, dst)
+        new_url = f"{_RESOURCE_URL_BASE}?v={new_hash}"
+        _LOGGER.warning("Battery Manager: fallback resource check — probeer toe te voegen: %s", new_url)
+        await async_add_external_resource(hass, new_url, "module")
+        _LOGGER.warning("Battery Manager: fallback resource toegevoegd via API: %s", new_url)
+    except Exception as exc:
+        _LOGGER.warning("Battery Manager: fallback resource toevoegen via API mislukt: %s", exc)
 
     # Stap 1b: voeg de resource toe via de officiële Home Assistant API (vanaf 2023.4+)
     try:
@@ -220,6 +232,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(async_call_later(hass, 60, _delayed_refresh))
     hass.data[DOMAIN][entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # ── Kwartiergrens-timer: herbereken actie exact op :00, :15, :30, :45 ──
+    # De coordinator draait elke 15 min, maar niet gesynchroniseerd met de
+    # kwartiergrens. Deze timer zorgt dat de actie direct wisselt op het
+    # juiste moment.
+    from homeassistant.helpers.event import async_track_utc_time_change
+
+    async def _on_quarter_boundary(now):
+        """Re-evaluate battery action at each quarter boundary."""
+        if coordinator.data and coordinator.data.get("schedule"):
+            _LOGGER.info("battery_manager: kwartiergrens %s — herberekening actie", now.strftime("%H:%M"))
+            await coordinator._apply_battery_control(coordinator.data["schedule"])
+
+    entry.async_on_unload(
+        async_track_utc_time_change(hass, _on_quarter_boundary, minute=[0, 15, 30, 45], second=5)
+    )
+
+    # Fallback: controleer na 2 minuten of de chart-sensor bestaat, anders forceer een refresh en log een waarschuwing
+    async def _fallback_check_sensor(_now=None):
+        entity_id = "sensor.battery_manager_chart"
+        state = hass.states.get(entity_id)
+        if state is None:
+            _LOGGER.warning("Battery Manager: Fallback — sensor '%s' bestaat niet na 2 minuten, forceer refresh", entity_id)
+            await coordinator.async_refresh()
+        else:
+            _LOGGER.info("Battery Manager: Fallback — sensor '%s' bestaat en heeft attribuut chart_data: %s", entity_id, "chart_data" in (state.attributes or {}))
+
+    entry.async_on_unload(async_call_later(hass, 120, _fallback_check_sensor))
 
     # Service: battery_manager.force_action
     # Test-hulpmiddel: stuur de batterij direct aan zonder te wachten op het schema.

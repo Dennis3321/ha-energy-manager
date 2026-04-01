@@ -158,6 +158,37 @@ Herstart HA daarna. Dit maakt ook de `[EM-DEBUG]`-berichten zichtbaar (dezelfde 
 | 7 mrt 2026 | 5 | Verbeterde logging toegevoegd voor diagnose | n.v.t. | WARNING-logs bij actiewijziging en blokkering |
 | 15 mrt 2026 | huidig | Batterij laadt én ontlaadt niet | Onbekend — voer diagnosestappen uit | Zie boven |
 | 18 mrt 2026 | huidig | Grafiek toont prijzen per uur i.p.v. kwartier | Tibber API standaard uurprijzen (RCA-9) | `priceInfo(resolution: QUARTER_HOURLY)` query |
+| 1 apr 2026 | huidig | Integratie laadt niet, grafiek leeg, batterij idle | Meerdere bugs (RCA-10 t/m RCA-14) | Zie RCA-10–14 hieronder |
+
+---
+
+### RCA-10 — `from __future__ import annotations` na import statement (SyntaxError)
+- **Oorzaak:** `__init__.py` bevatte `import logging` + een logging-call vóór `from __future__ import annotations`. Python eist dat `from __future__` het allereerste statement is → **SyntaxError** bij module-import → hele integratie laadt niet.
+- **Fix:** `import logging` en de logging-call verwijderd; `from __future__` staat nu correct als eerste statement.
+
+### RCA-11 — IndentationError in `_apply_battery_control` (coordinator.py)
+- **Oorzaak:** De methode `_apply_battery_control` had een inconsistente indentatie: docstring en try-block op 16 spaties, rest van de methode op 8 spaties → **IndentationError** → module importeert niet.
+- **Fix:** Indentatie gecorrigeerd naar consistente 8 spaties.
+
+### RCA-12 — Grafiek SOC-lijn vlak (`_build_chart_data` las live limieten)
+- **Oorzaak:** `_build_chart_data()` riep `_get_dynamic_limits()` aan om de laad/ontlaadlimieten van de Zendure-entiteiten te lezen. Maar die waarden reflecteren de **huidige** actie (bijv. 0W bij 'normal'). De SOC-projectie berekende daardoor 0 kWh per kwartier → vlakke lijn.
+- **Fix:** SOC-projectie in `_build_chart_data()` gebruikt nu altijd `DEFAULT_BATTERY_MAX_CHARGE` / `DEFAULT_BATTERY_MAX_DISCHARGE`.
+
+### RCA-13 — Ontladen op 0W (`_apply_battery_control` las live limieten)
+- **Oorzaak:** Zelfde probleem als RCA-12, maar dan voor het daadwerkelijke stuurcommando. `_get_dynamic_limits()` las de entity-waarden (0W van vorige 'normal' actie) i.p.v. de DEFAULT constanten → Zendure werd aangestuurd met ontlaadlimiet=0W.
+- **Fix:** `_apply_battery_control()` gebruikt nu altijd `DEFAULT_BATTERY_MAX_CHARGE` / `DEFAULT_BATTERY_MAX_DISCHARGE`.
+
+### RCA-14 — Zonne-drempel override verwijderd (te weinig ontlaadslots)
+- **Oorzaak:** De RCA-4 fix (zonne-drempel bij SOC ≥ 85%) was verwijderd door een eerdere bewerking. Zonder deze override was de ontlaaddrempel €0.3449, waardoor kwartieren met prijs €0.30–€0.34 niet voor ontladen werden ingepland ondanks volle accu.
+- **Fix:** Zonne-drempel override hersteld: bij SOC ≥ 85% wordt de drempel verlaagd naar `afschrijving / η_d ≈ €0.054`.
+
+### RCA-15 — Actiewissel niet gesynchroniseerd met kwartiergrens
+- **Oorzaak:** De coordinator draait elke 15 minuten vanaf het moment van de laatste herstart, niet gesynchroniseerd met de kwartiergrens (:00/:15/:30/:45). Hierdoor kon een actiewissel tot 14 minuten te laat plaatsvinden.
+- **Fix:** Kwartiergrens-timer toegevoegd in `__init__.py` via `async_track_utc_time_change` die op :00/:15/:30/:45 (+5s) de batterijactie herbeoordeelt op basis van het gecachede schema.
+
+### RCA-16 — Laad/ontlaadlimieten teruggezet naar 2400W
+- **Oorzaak:** Bij RCA-8 (maart 2026) waren de DEFAULT limieten verlaagd van 2400W naar 800W vanwege een firmware-update. De firmware-beperking is inmiddels opgeheven.
+- **Fix:** `const.py`: `DEFAULT_BATTERY_MAX_CHARGE` en `DEFAULT_BATTERY_MAX_DISCHARGE` terug naar 2400W.
 
 ---
 
