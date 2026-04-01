@@ -192,4 +192,23 @@ Herstart HA daarna. Dit maakt ook de `[EM-DEBUG]`-berichten zichtbaar (dezelfde 
 
 ---
 
+### RCA-17 — Prijsdata als €0,00 weergegeven i.p.v. "geen data" (1 april 2026)
+- **Oorzaak:** Als de Tibber API geen prijzen retourneert, werden synthetische kwartieren aangemaakt met `total: None`. In `_build_chart_data()` werd `None` via `quarter.get("total", 0) or 0` omgezet naar `0`, waardoor de frontend een vlakke groene lijn op €0,00 tekende.
+- **Gevolg:** Planner zag geen prijsverschillen → geen laad/ontlaadacties, geen besparing, SOC daalt passief.
+- **Fix:** `coordinator.py`: prijs wordt nu als `null` doorgegeven als er geen data is, frontend filtert `null` correct weg.
+
+### RCA-18 — Geen prijscache bij Tibber API-uitval (1 april 2026)
+- **Oorzaak:** Bij elke HA-herstart of Tibber API-storing werden prijzen opnieuw opgehaald. Als de API niets retourneerde, werd er zonder prijsdata gewerkt — ook al was er kort daarvoor nog geldige data.
+- **Fix:** Prijscache-mechanisme toegevoegd in `coordinator.py` (`.storage/battery_manager_price_cache.json`):
+  - Bij succesvolle Tibber-fetch: prijzen worden gecached met timestamp.
+  - Bij mislukte fetch: gecachede prijzen worden geladen als het laatste slot nog in de toekomst ligt.
+  - Cache overleeft HA-herstarts en is geldig tot het einde van de laatst beschikbare dag.
+
+### RCA-19 — Ongebruikte yPower-as in frontend (1 april 2026)
+- **Oorzaak:** Na het verwijderen van de usage-dataset bleef de "kW"-as (yPower) bestaan in `battery-dashboard.js` zonder gekoppelde dataset.
+- **Gevolg:** Overbodige linkeras nam ruimte in op de grafiek.
+- **Fix:** `yPower`-as verwijderd uit `battery-dashboard.js`.
+
+---
+
 *Dit document wordt bijgehouden als terugkerende RCA-log. Voeg nieuwe instanties toe aan de versiehistorie.*

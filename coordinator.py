@@ -112,9 +112,13 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         self._soc_cache_path = (
             Path(hass.config.config_dir) / ".storage" / "battery_manager_soc_cache.json"
         )
+        self._price_cache_path = (
+            Path(hass.config.config_dir) / ".storage" / "battery_manager_price_cache.json"
+        )
         # Cache wordt geladen bij de eerste async update (niet hier — blocking I/O verboden in __init__)
         self._last_known_soc: float | None = None
         self._soc_cache_loaded: bool = False
+        self._price_cache_loaded: bool = False
 
     def _dbg(self, msg: str, *args) -> None:
         """Log at INFO level when debug_logging option is enabled."""
@@ -132,6 +136,34 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             )
             self._dbg("Prijzen: %d vandaag, %d morgen",
                       len(prices_today), len(prices_tomorrow))
+
+            # ── Prijscache: opslaan bij succes, terugvallen bij falen ──
+            if prices_today:
+                # Verse data van Tibber → opslaan in cache
+                await self.hass.async_add_executor_job(
+                    self._save_price_cache, prices_today, prices_tomorrow
+                )
+                _LOGGER.info(
+                    "battery_manager: prijscache bijgewerkt (%d vandaag, %d morgen)",
+                    len(prices_today), len(prices_tomorrow),
+                )
+            else:
+                # Tibber geeft niets → probeer gecachede prijzen
+                cached_today, cached_tomorrow = await self.hass.async_add_executor_job(
+                    self._load_price_cache
+                )
+                if cached_today:
+                    prices_today = cached_today
+                    prices_tomorrow = cached_tomorrow
+                    _LOGGER.warning(
+                        "battery_manager: Tibber API gaf geen data — "
+                        "gebruik gecachede prijzen (%d vandaag, %d morgen)",
+                        len(prices_today), len(prices_tomorrow),
+                    )
+                else:
+                    _LOGGER.warning(
+                        "battery_manager: Tibber API gaf geen data en geen bruikbare cache beschikbaar"
+                    )
 
             # Laad SOC-cache bij eerste update (mag niet in __init__ — blocking I/O)
             if not self._soc_cache_loaded:
@@ -308,7 +340,8 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             # discharge = positief (we kopen minder van het net)
             # charge    = negatief (we kopen extra van het net)
             _kwh_grid = (charge_limit / 1000) * 0.25  # 0.6 kWh
-            _price = quarter.get("total", 0) or 0
+            _raw_price = quarter.get("total")
+            _price = float(_raw_price) if _raw_price is not None else 0
             if action_i == "discharge":
                 savings_delta = round(_price * _kwh_grid, 4)
             elif action_i in ("charge", "all_on"):
@@ -319,7 +352,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             chart.append({
                 "time": label,
                 "starts_at": starts_at_raw,
-                "price": round(quarter.get("total", 0) or 0, 4),
+                "price": round(float(_raw_price), 4) if _raw_price is not None else None,
                 "action": action_i,
                 "battery_soc": chart_soc,
                 "battery_flow_w": battery_flow_w,
@@ -387,6 +420,59 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             self._soc_cache_path.write_text(json.dumps({"soc": round(value, 1)}))
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("battery_manager: SOC-cache opslaan mislukt: %s", exc)
+
+    def _load_price_cache(self) -> tuple[list, list]:
+        """Lees gecachede prijsdata uit het opslagbestand.
+
+        Retourneert (prices_today, prices_tomorrow) als de cache geldig is
+        (d.w.z. het laatste slot ligt nog in de toekomst), anders ([], []).
+        Cache overleeft HA-herstarts en is geldig tot het einde van de
+        laatste dag waarvoor prijzen beschikbaar zijn (typisch overmorgen).
+        """
+        try:
+            data = json.loads(self._price_cache_path.read_text())
+            cached_today = data.get("prices_today", [])
+            cached_tomorrow = data.get("prices_tomorrow", [])
+            saved_at = data.get("saved_at", "")
+
+            if not cached_today:
+                return [], []
+
+            # Controleer of de cache nog bruikbaar is: het laatste slot
+            # moet in de toekomst liggen (+ 15 min marge).
+            all_cached = cached_today + cached_tomorrow
+            last_slot = all_cached[-1].get("startsAt", "")
+            try:
+                last_dt = datetime.fromisoformat(last_slot).astimezone(tz=None).replace(tzinfo=None)
+                if last_dt + timedelta(minutes=15) < datetime.now():
+                    _LOGGER.info(
+                        "battery_manager: prijscache verlopen (laatste slot %s), wordt genegeerd",
+                        last_slot[:16],
+                    )
+                    return [], []
+            except (ValueError, TypeError):
+                return [], []
+
+            _LOGGER.info(
+                "battery_manager: prijscache geladen (opgeslagen %s): %d vandaag, %d morgen",
+                saved_at[:19], len(cached_today), len(cached_tomorrow),
+            )
+            return cached_today, cached_tomorrow
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError, TypeError):
+            pass
+        return [], []
+
+    def _save_price_cache(self, prices_today: list, prices_tomorrow: list) -> None:
+        """Sla prijsdata op zodat deze beschikbaar blijft na HA-herstart."""
+        try:
+            self._price_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._price_cache_path.write_text(json.dumps({
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "prices_today": prices_today,
+                "prices_tomorrow": prices_tomorrow,
+            }))
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.debug("battery_manager: prijscache opslaan mislukt: %s", exc)
 
     def _read_battery_soc(self, entity_id: str) -> float:
         """Lees de batterij-SOC; val terug op laatste bekende waarde bij unavailable/unknown."""

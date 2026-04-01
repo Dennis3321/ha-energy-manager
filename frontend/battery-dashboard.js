@@ -78,6 +78,13 @@ class BatteryDashboardCard extends HTMLElement {
       return;
     }
 
+    // Controleer of er echte prijsdata is (niet alleen null-waarden)
+    const hasPrices = chartData.some((d) => d.price != null);
+    if (!hasPrices) {
+      this._showMessage("Geen prijsdata van Tibber beschikbaar — wacht op de volgende API-update.");
+      // Toch doorgaan met tekenen zodat de SOC-lijn zichtbaar is
+    }
+
     // Quick content-hash to skip unnecessary re-renders
     // Include first solar_w value so chart updates when Forecast.Solar data arrives
     const hash = `${chartData.length}|${chartData[0]?.starts_at}|${chartData[0]?.price}`;
@@ -257,8 +264,8 @@ class BatteryDashboardCard extends HTMLElement {
       }
     });
 
-    // X-axis labels: show every full hour (every 4th quarter); first item always shown
-    const labels = data.map((d, i) => (i === 0 || i % 4 === 0 ? d.time : ""));
+    // X-axis labels: show every 2 uur (elke 8 kwartieren); eerste item altijd tonen
+    const labels = data.map((d, i) => (i === 0 || i % 8 === 0 ? d.time : ""));
 
     const prices = data.map((d) => (d.price != null ? +d.price : null));
     // gebruik verwijderd
@@ -443,7 +450,8 @@ class BatteryDashboardCard extends HTMLElement {
           x: {
             ticks: {
               autoSkip: false,
-              maxRotation: 0,
+              maxRotation: 45,
+              minRotation: 45,
               color: "var(--secondary-text-color, #6b7280)",
               font: { size: 10 },
             },
@@ -485,23 +493,6 @@ class BatteryDashboardCard extends HTMLElement {
             grid: { drawOnChartArea: false },
             // Offset so it doesn't overlap with the price axis
             offset: true,
-          },
-          yPower: {
-            type: "linear",
-            position: "left",
-            title: {
-              display: true,
-              text: "kW",
-              color: "var(--secondary-text-color, #6b7280)",
-              font: { size: 11 },
-            },
-            min: 0,
-            ticks: {
-              color: "var(--secondary-text-color, #6b7280)",
-              font: { size: 10 },
-              callback: (v) => `${v.toFixed(1)}`,
-            },
-            grid: { color: "rgba(128,128,128,0.12)" },
           },
           ySavings: {
             type: "linear",
