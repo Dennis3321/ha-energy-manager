@@ -30,10 +30,9 @@
 ---
 
 ### RCA-4 — Ontlaaddrempel te hoog door goedkoop toekomstig laadkwartier (deadlock)
-- **Oorzaak (sessie 6, 13 maart 2026):** De planner zag een goedkoop laadkwartier morgen (bijv. €0.26), berekende daarmee een hoge ontlaaddrempel (`€0.3746`). Avondprijzen (bijv. €0.33) lagen net onder de drempel → nul ontlaadslots, terwijl de accu al vol was via de zon.
+- **Oorzaak (sessie 6, 13 maart 2026):** De planner zag een goedkoop laadkwartier morgen (bijv. €0.26), berekende daarmee een hoge ontlaaddrempel (`€0.3746`). Avondprijzen (bijv. €0.33) lagen net onder de drempel → nul ontlaadslots, terwijl de accu al vol was.
 - **Formule:** `discharge_threshold = (P_koop + η_c × afschr) / η_c²`
-- **Fix (zonne-drempel override):** Als `battery_soc ≥ 85%` wordt de drempel verlaagd naar `afschrijving / η_d ≈ €0.054`. Alle kwartieren boven ~€0.05 worden dan ingepland voor ontladen.
-- **Diagnosekenmerk:** `/config/battery_manager_diag.txt` toont `[zonne-drempel]` achter de drempelregel.
+- **Fix:** Als `battery_soc ≥ 85%` wordt de drempel verlaagd naar `afschrijving / η_d ≈ €0.054`. Alle kwartieren boven ~€0.05 worden dan ingepland voor ontladen.
 
 ---
 
@@ -45,7 +44,7 @@
 ---
 
 ### RCA-6 — Accu al op MAX_SOC → geen laadsloten ingepland
-- **Oorzaak:** `soc_needed = max(0, MAX_SOC − battery_soc − soc_from_all_on)` is 0 of bijna 0 → `quarters_to_charge = 0`.
+- **Oorzaak:** `soc_needed = max(0, MAX_SOC − battery_soc)` is 0 of bijna 0 → `quarters_to_charge = 0`.
 - **Gevolg:** Geen laadkwartieren in het schema; als ook de arbitrage geen paren vindt (te krappe marges), geen enkele actie.
 - **Log (diag):** `n_charge=0  n_discharge=0`
 - **Fix:** Geen actie vereist als de accu vol is. Controleer wel of de ontlaadkwartieren er zijn (zie RCA-4).
@@ -97,9 +96,24 @@
 - **Fix (3 onderdelen):**
   1. **Cost basis tracking:** Gewogen gemiddelde €/kWh van opgeslagen energie wordt bijgehouden en gepersisteerd in de SOC-cache. De ontlaaddrempel gebruikt `min(cost_basis, goedkoopste_toekomstige_laadprijs)` zodat goedkoop geladen energie niet wordt "vergeten" bij een prijsverversing.
   2. **Arbitrage vóór fill:** Arbitrage-paren worden nu VÓÓR de fill-charge stap gezocht, zodat winstgevende intra-day cycli niet worden weggedrukt door goedkopere morgen-slots.
-  3. **Zonne-drempel verlaagd:** Van SOC ≥ 85% naar SOC ≥ 70%, zodat de batterij agressiever ontlaadt als er al voldoende energie is opgeslagen.
+  3. **SOC-drempel verlaagd:** Van SOC ≥ 85% naar SOC ≥ 70%, zodat de batterij agressiever ontlaadt als er al voldoende energie is opgeslagen.
 - **Log:** `cost basis bijgewerkt → €X.XXXX/kWh` en `cost basis €X.XXXX < goedkoopste toekomstige €X.XXXX → lagere ontlaaddrempel`
 - **Diagnosekenmerk:** `/config/battery_manager_diag.txt` toont nu `effective_charge` en `cost_basis` in de header.
+
+---
+
+### RCA-11 — Ontladen geblokkeerd ondanks piekprijs (orphaned arbitrage + cap)
+- **Oorzaak (april 2026, sessie met 50ct-piek):** Drie samenhangende bugs verhinderden ontladen bij de duurste kwartieren:
+  1. **Orphaned arbitrage discharges:** Step 3c verwijderde overbodige laad-slots (18→13) maar liet de gekoppelde ontlaad-slots staan. Hierdoor was `already_discharge=18` terwijl slechts 13 charges resteerden. `remaining_discharge_slots = max(0, 14−18) = 0` → stap 4 kon GEEN nieuwe ontlaad-kandidaten (zoals vanavond €0.50) meer toewijzen.
+  2. **Harde cap op remaining_discharge_slots:** De `[:remaining_discharge_slots]` limiet blokkeerde alle vanavond-ontladingen zodra arbitrage-paren (morgen) al genoeg slots claimden.
+  3. **cheapest_charge_price fallback naar avg_price:** Wanneer geen laadslots waren ingepland, viel `cheapest_charge_price` terug op `avg_price` → de ontlaaddrempel werd onrealistisch hoog (soms >€0.50).
+- **Design:** Batterijsturing is puur prijsgestuurd.
+- **Fix (3 onderdelen):**
+  1. **Orphan cleanup:** Arbitrage-paren worden nu getracked als `(buy, sell)` tuples. Wanneer step 3c een laadslot verwijdert, wordt het gekoppelde ontlaadslot ook op 'normal' gezet.
+  2. **Verwijdering harde cap op remaining_discharge_slots:** Stap 4 wijst nu ALLE kandidaten boven de drempel toe. Stap 4b (chronologische SOC-simulatie) borgt alsnog dat de accu niet onder min_soc komt.
+  3. **cheapest_charge_price fallback verbeterd:** Fallback is nu de goedkoopste BESCHIKBARE prijs in alle toekomstige kwartieren, niet het gemiddelde.
+- **Ontlaaddrempel:** Enkel gebaseerd op de cost-basis-aware break-even formule.
+- **Diagnosekenmerk:** `battery_manager_diag.txt` toont nu `arb_discharge_kept` i.p.v. `max_discharge_quarters`.
 
 ---
 
@@ -169,7 +183,7 @@ Herstart HA daarna. Dit maakt ook de `[EM-DEBUG]`-berichten zichtbaar (dezelfde 
 
 | Datum | Sessie | Symptoom | Oorzaak | Fix |
 |---|---|---|---|---|
-| 13 mrt 2026 | 6 | Accu ontlaadt niet bij SOC ~99% en avondprijzen €0.33 | Deadlock drempelberekening (RCA-4) | Zonne-drempel override bij SOC ≥ 85% |
+| 13 mrt 2026 | 6 | Accu ontlaadt niet bij SOC ~99% en avondprijzen €0.33 | Deadlock drempelberekening (RCA-4) | SOC-drempel override bij SOC ≥ 85% |
 | 7 mrt 2026 | 5 | Verbeterde logging toegevoegd voor diagnose | n.v.t. | WARNING-logs bij actiewijziging en blokkering |
 | 15 mrt 2026 | huidig | Batterij laadt én ontlaadt niet | Onbekend — voer diagnosestappen uit | Zie boven |
 | 18 mrt 2026 | huidig | Grafiek toont prijzen per uur i.p.v. kwartier | Tibber API standaard uurprijzen (RCA-9) | `priceInfo(resolution: QUARTER_HOURLY)` query |
@@ -193,9 +207,9 @@ Herstart HA daarna. Dit maakt ook de `[EM-DEBUG]`-berichten zichtbaar (dezelfde 
 - **Oorzaak:** Zelfde probleem als RCA-12, maar dan voor het daadwerkelijke stuurcommando. `_get_dynamic_limits()` las de entity-waarden (0W van vorige 'normal' actie) i.p.v. de DEFAULT constanten → Zendure werd aangestuurd met ontlaadlimiet=0W.
 - **Fix:** `_apply_battery_control()` gebruikt nu altijd `DEFAULT_BATTERY_MAX_CHARGE` / `DEFAULT_BATTERY_MAX_DISCHARGE`.
 
-### RCA-14 — Zonne-drempel override verwijderd (te weinig ontlaadslots)
-- **Oorzaak:** De RCA-4 fix (zonne-drempel bij SOC ≥ 85%) was verwijderd door een eerdere bewerking. Zonder deze override was de ontlaaddrempel €0.3449, waardoor kwartieren met prijs €0.30–€0.34 niet voor ontladen werden ingepland ondanks volle accu.
-- **Fix:** Zonne-drempel override hersteld: bij SOC ≥ 85% wordt de drempel verlaagd naar `afschrijving / η_d ≈ €0.054`.
+### RCA-14 — SOC-drempel override verwijderd (te weinig ontlaadslots)
+- **Oorzaak:** De RCA-4 fix (SOC-drempel bij SOC ≥ 85%) was verwijderd door een eerdere bewerking. Zonder deze override was de ontlaaddrempel €0.3449, waardoor kwartieren met prijs €0.30–€0.34 niet voor ontladen werden ingepland ondanks volle accu.
+- **Fix:** SOC-drempel override hersteld: bij SOC ≥ 85% wordt de drempel verlaagd naar `afschrijving / η_d ≈ €0.054`.
 
 ### RCA-15 — Actiewissel niet gesynchroniseerd met kwartiergrens
 - **Oorzaak:** De coordinator draait elke 15 minuten vanaf het moment van de laatste herstart, niet gesynchroniseerd met de kwartiergrens (:00/:15/:30/:45). Hierdoor kon een actiewissel tot 14 minuten te laat plaatsvinden.

@@ -16,7 +16,7 @@
 
 # Battery Manager – Specificatie
 
-Deze integratie bestuurt een thuisbatterij volledig prijsgestuurd, zonder rekening te houden met zonnepanelen of geschat huishoudelijk gebruik. De logica is puur gericht op het optimaliseren van laden en ontladen op basis van actuele en verwachte stroomprijzen.
+Deze integratie bestuurt een thuisbatterij volledig prijsgestuurd. De logica is puur gericht op het optimaliseren van laden en ontladen op basis van actuele en verwachte stroomprijzen.
 
 ## Instelbare parameters
 | Parameter              | Standaard  | Beschrijving                       |

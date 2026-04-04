@@ -86,7 +86,6 @@ class BatteryDashboardCard extends HTMLElement {
     }
 
     // Quick content-hash to skip unnecessary re-renders
-    // Include first solar_w value so chart updates when Forecast.Solar data arrives
     const hash = `${chartData.length}|${chartData[0]?.starts_at}|${chartData[0]?.price}`;
     if (hash === this._lastHash) return;
 

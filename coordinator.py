@@ -264,8 +264,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         """Build per-quarter chart data for the next 48 hours.
 
         De battery_soc in de chart is een projectie op basis van uitsluitend
-        grid-acties (laden/ontladen uit het schema). Zonne-opbrengst speelt
-        geen rol — bij hoge prijs is terugleveren waardevoller dan accumuladen.
+        grid-acties (laden/ontladen uit het schema).
 
         battery_soc = de ECHTE huidige SOC op dit moment; dit is het startpunt
         van de witte SOC-lijn op de 'nu'-grens.
@@ -314,8 +313,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 projected_soc = battery_soc
                 _LOGGER.info("[BM] Projectie start bij kwartier %d met SOC %.2f%%", i, projected_soc)
 
-            # SOC-projectie puur op grid-acties (zon speelt geen rol — terugleveren
-            # bij hoge prijs is waardevoller dan accumuladen met zonne-energie).
+            # SOC-projectie puur op grid-acties.
             chart_soc: float | None = None
             if projected_soc is not None and is_future:
                 old_soc = projected_soc
@@ -954,6 +952,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         soc_at = _recompute_soc_at(future, battery_soc)
 
         _arb_used: set[int] = set()
+        _arb_pairs_list: list[tuple] = []  # (buy_entry, sell_entry) — voor step 3c cleanup
         _buy_pool  = sorted(
             [e for e in future if e['action'] == 'normal' and e['price'] is not None],
             key=lambda x: x['price'],
@@ -987,6 +986,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             _best_sell['action'] = 'discharge'
             _arb_used.add(_buy['idx'])
             _arb_used.add(_best_sell['idx'])
+            _arb_pairs_list.append((_buy, _best_sell))
             # Herbereken SOC na deze toewijzing zodat de volgende iteratie
             # juiste ruimte-check krijgt
             soc_at = _recompute_soc_at(future, battery_soc)
@@ -1042,6 +1042,9 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     peak = s
             return peak
 
+        # Bouw lookup: charge-idx → paired discharge entry (voor orphan cleanup)
+        _arb_charge_to_discharge = {buy['idx']: sell for buy, sell in _arb_pairs_list}
+
         charge_slots_desc = sorted(
             [e for e in future if e['action'] == 'charge'],
             key=lambda x: -(x['price'] or 0),
@@ -1053,6 +1056,14 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     "Planner 3c: overbodig laadslot verwijderd %s €%.4f",
                     e['starts_at'][11:16], e['price'] or 0,
                 )
+                # Verwijder ook de gekoppelde ontlad-slot (orphan fix)
+                paired_discharge = _arb_charge_to_discharge.get(e['idx'])
+                if paired_discharge and paired_discharge['action'] == 'discharge':
+                    paired_discharge['action'] = 'normal'
+                    self._dbg(
+                        "Planner 3c: gekoppeld ontlaadslot ook verwijderd %s €%.4f",
+                        paired_discharge['starts_at'][11:16], paired_discharge['price'] or 0,
+                    )
             else:
                 e['action'] = 'charge'
 
@@ -1075,10 +1086,18 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             sum(e['price'] for e in future if e['price'] is not None) /
             max(1, sum(1 for e in future if e['price'] is not None))
         )
+        # Goedkoopste prijs waartegen we energie ZOUDEN KUNNEN kopen
+        # (niet alleen slots die al aan laden zijn toegewezen).
+        # Dit voorkomt dat de ontlaaddrempel onrealistisch hoog wordt
+        # wanneer er geen laadsloten gepland zijn (bijv. accu al vol).
+        cheapest_available_price = min(
+            (e['price'] for e in future if e['price'] is not None),
+            default=avg_price,
+        )
         cheapest_charge_price = min(
             (e['price'] for e in future
              if e['action'] in ('charge', 'all_on') and e['price'] is not None),
-            default=avg_price,
+            default=cheapest_available_price,
         )
 
         # Bepaal effectieve laadprijs: gebruik cost basis als die lager is
@@ -1096,27 +1115,13 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             / (DEFAULT_CHARGE_EFFICIENCY ** 2)
         )
 
-        # Zonne-drempel override (RCA-4): als de accu al (bijna) vol is,
-        # is de opgeslagen energie gratis (zon/eerder geladen). De drempel
-        # hoeft dan alleen de afschrijving te dekken, niet de terugkoopprijs.
-        # Verlaagd van 85% naar 70% voor agressiever ontladen.
-        if battery_soc >= 70:
-            solar_threshold = BATTERY_DEPRECIATION / DEFAULT_CHARGE_EFFICIENCY
-            if solar_threshold < discharge_threshold:
-                discharge_threshold = solar_threshold
-                self._dbg(
-                    "Planner: zonne-drempel actief (SOC=%.0f%% ≥ 70%%) → drempel=€%.4f",
-                    battery_soc, discharge_threshold,
-                )
-
-        total_charge_quarters = sum(1 for e in future if e['action'] in ('charge', 'all_on'))
-        estimated_peak_soc = min(DEFAULT_MAX_SOC, battery_soc + total_charge_quarters * soc_per_charge_quarter)
-        max_discharge_quarters = max(0, int((estimated_peak_soc - min_soc) / soc_per_discharge_quarter))
-        # Trek al geplande ontlaadslots af (uit arbitrage stap 2.5)
         already_discharge = sum(1 for e in future if e['action'] == 'discharge')
-        remaining_discharge_slots = max(0, max_discharge_quarters - already_discharge)
 
-        # Kandidaten: nog "normal", duur genoeg én voldoende SOC aanwezig
+        # Kandidaten: nog "normal", duur genoeg én voldoende SOC aanwezig.
+        # Geen harde cap meer op remaining_discharge_slots — stap 4b
+        # (chronologische SOC-simulatie) borgt dat de accu niet onder
+        # min_soc komt. De oude cap blokkeerde vanavond-ontladingen wanneer
+        # arbitrage-paren (morgen) al te veel slots claimden.
         discharge_candidates = [
             e for e in future
             if e['action'] == 'normal' and e['price'] is not None
@@ -1124,15 +1129,15 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             and e['_proj_soc'] - soc_per_discharge_quarter >= min_soc
         ]
         discharge_candidates_sorted = sorted(discharge_candidates, key=lambda e: -e['price'])
-        for e in discharge_candidates_sorted[:remaining_discharge_slots]:
+        for e in discharge_candidates_sorted:
             e['action'] = 'discharge'
 
         self._dbg(
-            "Planner: eff_laadprijs=€%.4f (cost_basis=%s), drempel=€%.4f, max=%d (+%d arb), kandidaten=%d",
+            "Planner: eff_laadprijs=€%.4f (cost_basis=%s), drempel=€%.4f, arb_discharge=%d, nieuwe_kandidaten=%d",
             effective_charge_price,
             f"€{self._effective_charge_price:.4f}" if self._effective_charge_price is not None else "n/a",
             discharge_threshold,
-            remaining_discharge_slots, already_discharge, len(discharge_candidates),
+            already_discharge, len(discharge_candidates),
         )
 
         # ── Stap 4b: chronologische SOC-simulatie (veiligheidsnet) ───────
@@ -1168,11 +1173,11 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 f"SOC={battery_soc:.1f}%  min_soc={min_soc}%",
                 f"effective_charge=€{effective_charge_price:.4f}  cost_basis={'€'+format(self._effective_charge_price,'.4f') if self._effective_charge_price is not None else 'n/a'}",
                 f"discharge_threshold=€{discharge_threshold:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
-                f"quarters_to_charge={quarters_to_charge}  arb_pairs={len(_arb_used)//2}  max_discharge_quarters={max_discharge_quarters}",
+                f"quarters_to_charge={quarters_to_charge}  arb_pairs={len(_arb_used)//2}  arb_discharge_kept={already_discharge}",
                 f"n_charge={n_charge}  n_discharge={n_discharge}",
                 "--- toekomstige acties (na alle correcties) ---",
             ]
-            for e in future[:96]:
+            for e in future:
                 t = e.get('starts_at', '')
                 try:
                     t_short = t[11:16]

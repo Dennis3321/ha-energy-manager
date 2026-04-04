@@ -26,7 +26,7 @@ Laatste update: 4 april 2026
   - `normal` – standby
 - Extra arbitrage-cycli: zoekt rendabele koop/verkoop-paren – draait nu VÓÓR fill-charge zodat intra-day winst niet wordt weggedrukt door goedkopere morgen-slots
 - Cost basis tracking: gewogen gemiddelde laadprijs (€/kWh) van opgeslagen energie, gepersisteerd in SOC-cache; ontlaaddrempel gebruikt `min(cost_basis, goedkoopste_toekomstige)` zodat goedkoop geladen energie niet "vergeten" wordt bij prijsverversing
-- Zonne-drempel verlaagd van SOC ≥ 85% naar SOC ≥ 70% voor agressiever ontladen
+- SOC-drempel verlaagd van SOC ≥ 85% naar SOC ≥ 70% voor agressiever ontladen
 - Chronologische SOC-simulatie voorkomt dat ontladen de accu onder `min_soc` brengt
   - `_build_chart_data()` – per-kwartier dataset: prijs (€/kWh), SOC-projectie (%); uitgebreide debug-logging van laadplan en SOC-verloop in de HA logs
 - `_apply_battery_control()` – stuurt Zendure-batterij aan via select + number entiteiten
@@ -67,6 +67,21 @@ title: "Batterij Planning – komende 48 uur"
 
 ---
 
+## Wijzigingen sessie 8 (4 april 2026)
+
+### Alle zonne-energie referenties verwijderd
+Batterijsturing is puur prijsgestuurd — zonne-opbrengst speelt geen rol in de planning. Alle resterende verwijzingen naar zon/zonne/solar/panelen zijn verwijderd:
+- `coordinator.py` — 3 comments verwijderd
+- `frontend/battery-dashboard.js` — stale comment over `solar_w` / Forecast.Solar verwijderd
+- `RCA-info.md` — "zonne-drempel" hernoemd naar "SOC-drempel", solar-referenties verwijderd
+- `VOORTGANG.md` — zonne-referenties verwijderd/hernoemd
+- `SPEC.MD` — verwijzing naar zonnepanelen verwijderd
+- `fgvc.agent.md` — zonnepanelen, warmtepomp, boiler, autolader en Daikin appendix verwijderd
+
+**Bewust behouden:** "SolarFlow" en "SolarEdge" in entity-ID's en hardware-namen — dat zijn Zendure productnamen.
+
+---
+
 ## Wijzigingen sessie 7 (15 maart 2026)
 
 ### Firmware-update Zendure: max laad/ontlaadsnelheid 2400W → 800W
@@ -103,26 +118,23 @@ Na elke `set_value`/`select_option`-aanroep wacht de code 2 seconden en leest de
 
 ## Wijzigingen sessie 6 (13 maart 2026)
 
-### Bugfix: accu ontlaadt niet wanneer SOC hoog is door zonnelading
+### Bugfix: accu ontlaadt niet wanneer SOC hoog is
 
-**Symptoom:** Accu stond al dag op ~99% SOC (gevuld door zon), maar er werden geen ontlaadkwartieren gepland, terwijl avondprijzen (€0.33-€0.33) ruim boven afschrijvingsniveau lagen.
+**Symptoom:** Accu stond al dag op ~99% SOC, maar er werden geen ontlaadkwartieren gepland, terwijl avondprijzen (€0.33-€0.33) ruim boven afschrijvingsniveau lagen.
 
 **Oorzaak (deadlock in drempelberekening):**
 - Planner ziet 1% ruimte naar MAX_SOC → wijst 1 laadkwartier toe (goedkoopste komend etmaal, bijv. morgen 13:00 @ €0.26)
 - Discharge-drempel wordt berekend als `(P_koop + η_c × afschr) / η_c² = (0.26 + 0.9×0.048) / 0.81 = €0.3746`
 - Avondprijzen €0.33 liggen onder die drempel → nul ontlaadslots
-- Resultaat: accu blijft vol, morgen wordt toch bijgeladen via net, maar zon vult dan diezelfde dag opnieuw
+- Resultaat: accu blijft vol
 
-**Fix: zonne-drempel override (`coordinator.py`, stap 4):**
-- Als `battery_soc ≥ 85%` is de energie hoogstwaarschijnlijk gratis via de zon binnengekomen
-- Herlaadkost na ontladen is dan effectief €0 (zon vult de volgende dag bij)
-- Enige relevante kost is afschrijving; drempel wordt: `afschrijving / η_d = €0.048 / 0.9 = €0.054/kWh`
+**Fix: SOC-drempel override (`coordinator.py`, stap 4):**
+- Als `battery_soc ≥ 85%` wordt de drempel verlaagd naar `afschrijving / η_d = €0.048 / 0.9 = €0.054/kWh`
 - Bij €0.054 drempel worden alle avondkwartieren boven €0.054 als discharge ingepland (in de praktijk alles boven ~€0.15)
 - Winst bij bijv. €0.33: `0.33 × 0.9 − 0.048 ≈ €0.25/kWh`
-- Diagnosebestand toont `[zonne-drempel]` aan de drempelregel als override actief is
 
 **Te verifiëren morgen (14 maart):**
-- Zie log of diag: `discharge_threshold=€0.05xx  [zonne-drempel]`
+- Zie log of diag: `discharge_threshold=€0.05xx`
 - `n_discharge` moet > 0 zijn in de avond/nachturen
 - Actie-log toont `ACTIE GEWIJZIGD 'normal' → 'discharge'` op avondkwartieren
 
@@ -155,7 +167,6 @@ Na elke `set_value`/`select_option`-aanroep wacht de code 2 seconden en leest de
 - Alle klasse- en sensornames bijgewerkt
 
 ### Opschoning niet-batterij functionaliteit
-- Zonnepanelen (Forecast.Solar, sensor, grafiekdata) verwijderd
 - Warmtepomp-aansturing en `heatpump_on` actie verwijderd
 - Autolader-schakelaar verwijderd
 - Weersverwachting en koude-dag logica verwijderd
@@ -178,11 +189,11 @@ Na elke `set_value`/`select_option`-aanroep wacht de code 2 seconden en leest de
   - [x] Grafiek werkt — prijs (groen), SOC (wit)
 - [x] Fullscreen modal bij klikken op grafiek
 - [x] Debug logging via opties-schakelaar
-- [x] Zonnepanelen, warmtepomp, boiler en autolader verwijderd
+- [x] Warmtepomp, boiler en autolader verwijderd
 - [x] Hernoemd van Energy Manager naar Battery Manager
 - [x] Thread-safety: async_create_task + blocking I/O niet meer op event loop
 - [x] Logging: elke actiewijziging en geblokkeerd ontladen zichtbaar als WARNING in HA-logs
-- [x] Zonne-drempel override: bij SOC ≥ 85% wordt ontlaaddrempel gebaseerd op afschrijving i.p.v. herlaadkost
+- [x] SOC-drempel override: bij SOC ≥ 85% wordt ontlaaddrempel gebaseerd op afschrijving i.p.v. herlaadkost
 - [x] Firmware-update Zendure: max laad/ontlaad 2400W → 800W doorgevoerd in const.py
 - [x] Verificatie na commando: werkelijke waarde teruggelezen, afwijking gelogd als WARNING/ERROR
 - [x] Kritieke INFO-logs opgewaardeerd naar WARNING (nu altijd zichtbaar)
@@ -194,7 +205,7 @@ Na elke `set_value`/`select_option`-aanroep wacht de code 2 seconden en leest de
 ## TODO – volgende sessie
 
 - [ ] Verifieer firmware-fix vanavond (15 maart): controleer logs op `laadlimiet OK — gevraagd=800W, werkelijk=800W` en `batterij-aansturing geslaagd`
-- [ ] Verifieer zonne-drempel fix (controleer diag + logs op `[zonne-drempel]` en `n_discharge > 0`)
+- [ ] Verifieer SOC-drempel fix (controleer diag + logs en `n_discharge > 0`)
 - [ ] Terugleverkosten meenemen in ontlaaddrempel
 - [ ] Negatieve prijs look-ahead: accu vooraf leeg rijden voor maximale laadcapaciteit
 
