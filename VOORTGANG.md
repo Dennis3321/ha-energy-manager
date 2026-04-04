@@ -1,6 +1,6 @@
 # Battery Manager – Voortgang
 
-Laatste update: 15 maart 2026
+Laatste update: 4 april 2026
 
 ---
 
@@ -24,12 +24,14 @@ Laatste update: 15 maart 2026
   - `discharge` – ontladen boven drempel
   - `forced_off` – vakantie, niets aansturen
   - `normal` – standby
-- Extra arbitrage-cycli: zoekt rendabele koop/verkoop-paren buiten de vul-charge
+- Extra arbitrage-cycli: zoekt rendabele koop/verkoop-paren – draait nu VÓÓR fill-charge zodat intra-day winst niet wordt weggedrukt door goedkopere morgen-slots
+- Cost basis tracking: gewogen gemiddelde laadprijs (€/kWh) van opgeslagen energie, gepersisteerd in SOC-cache; ontlaaddrempel gebruikt `min(cost_basis, goedkoopste_toekomstige)` zodat goedkoop geladen energie niet "vergeten" wordt bij prijsverversing
+- Zonne-drempel verlaagd van SOC ≥ 85% naar SOC ≥ 70% voor agressiever ontladen
 - Chronologische SOC-simulatie voorkomt dat ontladen de accu onder `min_soc` brengt
   - `_build_chart_data()` – per-kwartier dataset: prijs (€/kWh), SOC-projectie (%); uitgebreide debug-logging van laadplan en SOC-verloop in de HA logs
 - `_apply_battery_control()` – stuurt Zendure-batterij aan via select + number entiteiten
 - Live SOC-veiligheidscheck: ontladen geblokkeerd als actuele SOC ≤ `min_soc`
-- SOC-cache overleeft HA-herstart (`.storage/battery_manager_soc_cache.json`)
+- SOC-cache overleeft HA-herstart (`.storage/battery_manager_soc_cache.json`) – bevat ook cost basis
 - Diagnosebestand na elke update: `/config/battery_manager_diag.txt`
 
 ### Sensoren (`sensor.py`)
@@ -50,6 +52,8 @@ Laatste update: 15 maart 2026
 - Rode stippellijn op huidig tijdstip ("nu")
 - Fullscreen modal bij klikken op grafiek (sluiten via ✕, achtergrond of Escape)
 - Automatische cache-busting via MD5-hash in resource URL
+- Canvas met vaste hoogte + `requestAnimationFrame` voor betrouwbare weergave bij F5-refresh
+- Guard op `customElements.define` voorkomt herregistratie-crash
   - Tooltips met prijs, accu-% en actie in het Nederlands
 
 **Lovelace resource URL:** `/local/battery_manager/battery-dashboard.js?v=<hash>`

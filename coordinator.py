@@ -117,6 +117,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         )
         # Cache wordt geladen bij de eerste async update (niet hier — blocking I/O verboden in __init__)
         self._last_known_soc: float | None = None
+        self._effective_charge_price: float | None = None  # gewogen gemiddelde €/kWh van opgeslagen energie
         self._soc_cache_loaded: bool = False
         self._price_cache_loaded: bool = False
 
@@ -402,10 +403,15 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
 
 
     def _load_soc_cache(self) -> float | None:
-        """Lees de gecachede SOC uit het opslagbestand (overleeft HA-herstart)."""
+        """Lees de gecachede SOC en cost basis uit het opslagbestand (overleeft HA-herstart)."""
         try:
             data = json.loads(self._soc_cache_path.read_text())
             value = float(data.get("soc", 0))
+            # Laad ook de cost basis (gewogen gem. laadprijs)
+            cb = data.get("cost_basis")
+            if cb is not None:
+                self._effective_charge_price = float(cb)
+                _LOGGER.info("battery_manager: cost basis geladen: €%.4f/kWh", self._effective_charge_price)
             if value > 0:
                 _LOGGER.info("battery_manager: SOC-cache geladen: %.1f%%", value)
                 return value
@@ -414,10 +420,13 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         return None
 
     def _save_soc_cache(self, value: float) -> None:
-        """Sla de huidige SOC op zodat de volgende HA-herstart ermee start."""
+        """Sla de huidige SOC en cost basis op zodat de volgende HA-herstart ermee start."""
         try:
             self._soc_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._soc_cache_path.write_text(json.dumps({"soc": round(value, 1)}))
+            cache_data = {"soc": round(value, 1)}
+            if self._effective_charge_price is not None:
+                cache_data["cost_basis"] = round(self._effective_charge_price, 6)
+            self._soc_cache_path.write_text(json.dumps(cache_data))
         except Exception as exc:  # noqa: BLE001
             _LOGGER.debug("battery_manager: SOC-cache opslaan mislukt: %s", exc)
 
@@ -708,6 +717,29 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             action, mode_option, charge_limit, discharge_limit,
         )
 
+        # ── Cost basis bijwerken bij laden ────────────────────────────────
+        # Gewogen gemiddelde €/kWh van opgeslagen energie, zodat de ontlaad-
+        # drempel rekening houdt met wat de stroom daadwerkelijk heeft gekost.
+        if action in ("charge", "all_on") and slot_price is not None:
+            kwh_per_quarter = (DEFAULT_BATTERY_MAX_CHARGE / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
+            soc_delta = (kwh_per_quarter / DEFAULT_BATTERY_CAPACITY) * 100
+            live_soc = self._read_battery_soc(config.get(CONF_BATTERY_SOC, ""))
+            charge_price = max(0.0, slot_price)  # negatieve prijzen tellen als gratis
+            if self._effective_charge_price is not None and live_soc > 0:
+                # Gewogen gemiddelde: bestaande energie + nieuwe energie
+                old_energy = live_soc
+                new_energy = soc_delta
+                self._effective_charge_price = (
+                    (self._effective_charge_price * old_energy + charge_price * new_energy)
+                    / (old_energy + new_energy)
+                )
+            else:
+                self._effective_charge_price = charge_price
+            _LOGGER.info(
+                "battery_manager: cost basis bijgewerkt → €%.4f/kWh (laadprijs €%.4f, SOC=%.1f%%)",
+                self._effective_charge_price, charge_price, live_soc,
+            )
+
         try:
             # Retry-lus: wacht tot entiteiten beschikbaar zijn (max 3 pogingen, 10s vertraging)
             _RETRY_ATTEMPTS = 3
@@ -892,42 +924,9 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             if e['price'] is not None and e['price'] <= 0:
                 e['action'] = 'all_on'
 
-        # ── Stap 2: bereken laadcapaciteit ───────────────────────────────
+        # ── Stap 2: bereken laad-/ontlaadcapaciteit ─────────────────────
         kwh_per_quarter_charge = (DEFAULT_BATTERY_MAX_CHARGE / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
         soc_per_charge_quarter = (kwh_per_quarter_charge / DEFAULT_BATTERY_CAPACITY) * 100
-
-        # Hoeveel SOC-punten moeten er nog bij via het net?
-        # (all_on kwartieren tellen al mee)
-        all_on_count = sum(1 for e in future if e['action'] == 'all_on')
-        soc_from_all_on = all_on_count * soc_per_charge_quarter
-        soc_needed = max(0.0, DEFAULT_MAX_SOC - battery_soc - soc_from_all_on)
-        quarters_to_charge = int(soc_needed / soc_per_charge_quarter) + 1 if soc_needed > 0 else 0
-
-        self._dbg(
-            "Planner: SOC=%.1f%%, nodig=%.1f%% → %d laadkwartieren via net (all_on=%d)",
-            battery_soc, soc_needed, quarters_to_charge, all_on_count,
-        )
-
-        # ── Stap 3: kies goedkoopste kwartieren om te laden ──────────────
-        # Inclusief het lopende kwartier (gestart < 15min geleden); excl. echte verleden.
-        candidates = [
-            e for e in future
-            if e['action'] == 'normal'
-            and e['price'] is not None
-        ]
-        candidates_sorted_cheap = sorted(candidates, key=lambda e: e['price'])
-        for e in candidates_sorted_cheap[:quarters_to_charge]:
-            e['action'] = 'charge'
-
-        # ── Stap 3.5: extra arbitrage-cycli ──────────────────────────────
-        # Naast het vullen van de accu: zoek extra rendabele laad/ontlaad-
-        # paren onder de nog "normal" kwartieren.
-        #
-        # Break-even formule (per kWh ingekocht van net):
-        #   P_sell × η_c × η_d > P_buy + η_c × afschrijving
-        #   => P_sell > (P_buy + η_c × afschr) / (η_c × η_d)
-        #
-        # Alleen uitvoeren als er daadwerkelijk "normal" slots overblijven.
         kwh_per_quarter_discharge = (DEFAULT_BATTERY_MAX_DISCHARGE / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
         soc_per_discharge_quarter = (kwh_per_quarter_discharge / DEFAULT_BATTERY_CAPACITY) * 100
 
@@ -945,6 +944,13 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     s = max(0.0, s - 0.05)
             return soc_map
 
+        # ── Stap 2.5: ARBITRAGE EERST — vind rendabele laad/ontlaad-paren ─
+        # Dit draait VÓÓR de fill-charge stap zodat winstgevende intra-day
+        # cycli niet worden weggedrukt door goedkopere morgen-slots.
+        #
+        # Break-even formule (per kWh ingekocht van net):
+        #   P_sell × η² > P_buy + η × afschrijving
+        #   => P_sell > (P_buy + η × afschr) / η²
         soc_at = _recompute_soc_at(future, battery_soc)
 
         _arb_used: set[int] = set()
@@ -992,17 +998,36 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 - _buy['price'] - DEFAULT_CHARGE_EFFICIENCY * BATTERY_DEPRECIATION,
             )
 
+        # ── Stap 3: vul de accu aan via de goedkoopste resterende slots ──
+        # Arbitrage-charges tellen al mee voor de SOC-berekening.
+        all_on_count = sum(1 for e in future if e['action'] == 'all_on')
+        arb_charge_count = sum(1 for e in future if e['action'] == 'charge')
+        soc_from_planned = (all_on_count + arb_charge_count) * soc_per_charge_quarter
+        soc_needed = max(0.0, DEFAULT_MAX_SOC - battery_soc - soc_from_planned)
+        quarters_to_charge = int(soc_needed / soc_per_charge_quarter) + 1 if soc_needed > 0 else 0
+
+        self._dbg(
+            "Planner: SOC=%.1f%%, nodig=%.1f%% → %d fill-kwartieren (all_on=%d, arb_charge=%d)",
+            battery_soc, soc_needed, quarters_to_charge, all_on_count, arb_charge_count,
+        )
+
+        candidates = [
+            e for e in future
+            if e['action'] == 'normal'
+            and e['price'] is not None
+        ]
+        candidates_sorted_cheap = sorted(candidates, key=lambda e: e['price'])
+        for e in candidates_sorted_cheap[:quarters_to_charge]:
+            e['action'] = 'charge'
+
         # ── Stap 3b: simuleer verwachte SOC per kwartier ─────────────────
-        # Inclusief fill-charges (stap 3) én arbitrage-charges (stap 3.5).
         soc_at = _recompute_soc_at(future, battery_soc)
         for e in future:
             e['_proj_soc'] = soc_at[e['idx']]
 
         # ── Stap 3c: verwijder overbodige laadsloten ─────────────────────
-        # Probleem: arb-laadsloten vóór de goedkope fill-periode vullen de
-        # accu te vroeg, waardoor de goedkoopste kwartieren nutteloos worden.
-        # Oplossing: verwijder laadsloten van duur → goedkoop zolang de accu
-        # zonder dat slot nog steeds MAX_SOC bereikt (het is dus overbodig).
+        # Verwijder laadsloten van duur → goedkoop zolang de accu zonder
+        # dat slot nog steeds MAX_SOC bereikt.
 
         def _peak_soc_sim(future_list, start_soc):
             """Simuleer SOC chronologisch en geef de hoogst bereikte SOC terug."""
@@ -1024,13 +1049,11 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         for e in charge_slots_desc:
             e['action'] = 'normal'  # tijdelijk verwijderen
             if _peak_soc_sim(future, battery_soc) >= DEFAULT_MAX_SOC - 0.1:
-                # Accu bereikt MAX_SOC ook zonder dit slot → definitief verwijderen
                 self._dbg(
                     "Planner 3c: overbodig laadslot verwijderd %s €%.4f",
                     e['starts_at'][11:16], e['price'] or 0,
                 )
             else:
-                # Dit slot is nodig om MAX_SOC te bereiken → herstellen
                 e['action'] = 'charge'
 
         # Herbereken na cleanup voor de ontlaadplanning
@@ -1039,11 +1062,15 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             e['_proj_soc'] = soc_at[e['idx']]
 
         # ── Stap 4: duurste kwartieren ontladen ──────────────────────────
-        # Drempel gebaseerd op de wiskundig correcte break-even formule,
-        # uitgaande van de goedkoopste laadprijs beschikbaar in het schema.
-        # Break-even: P_sell > (P_koop + η_c × afschr) / (η_c × η_d)
-        # Dit is altijd scherper dan het oude 'gem + afschr', waardoor meer
-        # rendabele ontlaadmomenten worden meegenomen.
+        # Drempel op basis van break-even formule.
+        #
+        # NIEUW: cost-basis-aware drempel.
+        # Als de accu al opgeslagen energie bevat (SOC > min_soc), is de
+        # effectieve laadprijs van die energie de cost basis (gewogen gem.
+        # van eerdere laadacties), niet de goedkoopste TOEKOMSTIGE laadprijs.
+        # Dit voorkomt dat winstgevende ontlaadkwartieren worden overgeslagen
+        # wanneer nieuwe prijsdata binnenkomt en de toekomstige laadprijzen
+        # hoger liggen dan wat eerder betaald is.
         avg_price = (
             sum(e['price'] for e in future if e['price'] is not None) /
             max(1, sum(1 for e in future if e['price'] is not None))
@@ -1053,25 +1080,39 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
              if e['action'] in ('charge', 'all_on') and e['price'] is not None),
             default=avg_price,
         )
+
+        # Bepaal effectieve laadprijs: gebruik cost basis als die lager is
+        effective_charge_price = cheapest_charge_price
+        if self._effective_charge_price is not None and battery_soc > min_soc + soc_per_discharge_quarter:
+            effective_charge_price = min(cheapest_charge_price, self._effective_charge_price)
+            if effective_charge_price < cheapest_charge_price:
+                self._dbg(
+                    "Planner: cost basis €%.4f < goedkoopste toekomstige €%.4f → lagere ontlaaddrempel",
+                    self._effective_charge_price, cheapest_charge_price,
+                )
+
         discharge_threshold = (
-            (cheapest_charge_price + DEFAULT_CHARGE_EFFICIENCY * BATTERY_DEPRECIATION)
+            (effective_charge_price + DEFAULT_CHARGE_EFFICIENCY * BATTERY_DEPRECIATION)
             / (DEFAULT_CHARGE_EFFICIENCY ** 2)
         )
 
         # Zonne-drempel override (RCA-4): als de accu al (bijna) vol is,
         # is de opgeslagen energie gratis (zon/eerder geladen). De drempel
         # hoeft dan alleen de afschrijving te dekken, niet de terugkoopprijs.
-        if battery_soc >= 85:
-            discharge_threshold = BATTERY_DEPRECIATION / DEFAULT_CHARGE_EFFICIENCY
-            self._dbg(
-                "Planner: zonne-drempel actief (SOC=%.0f%% ≥ 85%%) → drempel=€%.4f",
-                battery_soc, discharge_threshold,
-            )
+        # Verlaagd van 85% naar 70% voor agressiever ontladen.
+        if battery_soc >= 70:
+            solar_threshold = BATTERY_DEPRECIATION / DEFAULT_CHARGE_EFFICIENCY
+            if solar_threshold < discharge_threshold:
+                discharge_threshold = solar_threshold
+                self._dbg(
+                    "Planner: zonne-drempel actief (SOC=%.0f%% ≥ 70%%) → drempel=€%.4f",
+                    battery_soc, discharge_threshold,
+                )
 
         total_charge_quarters = sum(1 for e in future if e['action'] in ('charge', 'all_on'))
         estimated_peak_soc = min(DEFAULT_MAX_SOC, battery_soc + total_charge_quarters * soc_per_charge_quarter)
         max_discharge_quarters = max(0, int((estimated_peak_soc - min_soc) / soc_per_discharge_quarter))
-        # Trek al geplande ontlaadslots af (uit arbitrage stap 3.5)
+        # Trek al geplande ontlaadslots af (uit arbitrage stap 2.5)
         already_discharge = sum(1 for e in future if e['action'] == 'discharge')
         remaining_discharge_slots = max(0, max_discharge_quarters - already_discharge)
 
@@ -1087,14 +1128,14 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             e['action'] = 'discharge'
 
         self._dbg(
-            "Planner: goedkoopste_laad=€%.4f, ontlaaddrempel=€%.4f, max=%d kwartieren (+%d arb), kandidaten=%d",
-            cheapest_charge_price, discharge_threshold,
+            "Planner: eff_laadprijs=€%.4f (cost_basis=%s), drempel=€%.4f, max=%d (+%d arb), kandidaten=%d",
+            effective_charge_price,
+            f"€{self._effective_charge_price:.4f}" if self._effective_charge_price is not None else "n/a",
+            discharge_threshold,
             remaining_discharge_slots, already_discharge, len(discharge_candidates),
         )
 
         # ── Stap 4b: chronologische SOC-simulatie (veiligheidsnet) ───────
-        # De proj_soc filtering hierboven sluit structureel al te-vroeg-ontladen
-        # uit, maar we houden de simulatie als extra check.
         sim_soc = battery_soc
         for e in future:
             act = e['action']
@@ -1117,14 +1158,16 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         n_charge    = sum(1 for e in future if e['action'] in ('charge', 'all_on'))
         n_discharge = sum(1 for e in future if e['action'] == 'discharge')
         _LOGGER.info(
-            "battery_manager planner: SOC=%.1f%% | laden=%d kwartieren | ontladen=%d kwartieren | goedkoopste_laad=€%.4f | drempel=€%.4f",
-            battery_soc, n_charge, n_discharge, cheapest_charge_price, discharge_threshold,
+            "battery_manager planner: SOC=%.1f%% | laden=%d | ontladen=%d | eff_laad=€%.4f | drempel=€%.4f | cost_basis=%s",
+            battery_soc, n_charge, n_discharge, effective_charge_price, discharge_threshold,
+            f"€{self._effective_charge_price:.4f}" if self._effective_charge_price is not None else "n/a",
         )
         try:
             diag_lines = [
                 f"=== battery_manager planner {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===",
                 f"SOC={battery_soc:.1f}%  min_soc={min_soc}%",
-                f"cheapest_charge=€{cheapest_charge_price:.4f}  discharge_threshold=€{discharge_threshold:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
+                f"effective_charge=€{effective_charge_price:.4f}  cost_basis={'€'+format(self._effective_charge_price,'.4f') if self._effective_charge_price is not None else 'n/a'}",
+                f"discharge_threshold=€{discharge_threshold:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
                 f"quarters_to_charge={quarters_to_charge}  arb_pairs={len(_arb_used)//2}  max_discharge_quarters={max_discharge_quarters}",
                 f"n_charge={n_charge}  n_discharge={n_discharge}",
                 "--- toekomstige acties (na alle correcties) ---",

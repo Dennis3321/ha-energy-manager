@@ -89,7 +89,6 @@ class BatteryDashboardCard extends HTMLElement {
     // Include first solar_w value so chart updates when Forecast.Solar data arrives
     const hash = `${chartData.length}|${chartData[0]?.starts_at}|${chartData[0]?.price}`;
     if (hash === this._lastHash) return;
-    this._lastHash = hash;
 
     // Update "last updated" timestamp
     const lu = stateObj.attributes.last_updated;
@@ -106,7 +105,13 @@ class BatteryDashboardCard extends HTMLElement {
     }
 
     ensureChartJs()
-      .then(() => this._drawChart(chartData))
+      .then(() => {
+        // Wacht op browser layout zodat canvas afmetingen heeft (cruciaal bij F5)
+        requestAnimationFrame(() => {
+          this._drawChart(chartData);
+          this._lastHash = hash;  // pas NA succesvolle render opslaan
+        });
+      })
       .catch((err) => this._showMessage("Kan Chart.js niet laden: " + err.message));
   }
 
@@ -147,7 +152,7 @@ class BatteryDashboardCard extends HTMLElement {
           z-index: 5; cursor: zoom-in;
           background: transparent;
         }
-        canvas { display: block; width: 100% !important; }
+        canvas { display: block; width: 100% !important; min-height: 200px; }
         .expand-btn {
           display: none;
         }
@@ -177,7 +182,7 @@ class BatteryDashboardCard extends HTMLElement {
           </span>
         </div>
         <div class="chart-wrap">
-          <canvas id="chart"></canvas>
+          <canvas id="chart" height="250"></canvas>
           <div class="chart-click-overlay" id="chart-overlay"></div>
         </div>
         <div class="legend">
@@ -589,7 +594,9 @@ class BatteryDashboardCard extends HTMLElement {
   }
 }
 
-customElements.define("battery-dashboard-card", BatteryDashboardCard);
+if (!customElements.get("battery-dashboard-card")) {
+  customElements.define("battery-dashboard-card", BatteryDashboardCard);
+}
 
 // Register with HA custom cards picker
 window.customCards = window.customCards || [];

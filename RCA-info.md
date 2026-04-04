@@ -88,6 +88,21 @@
 
 ---
 
+### RCA-10 — Plan wordt tenietgedaan bij prijsverversing (cost basis verloren)
+- **Oorzaak (april 2026):** De planner herberekent elk kwartier het volledige schema vanuit nul. Wanneer nieuwe prijzen binnenkomen (bijv. morgen-prijzen rond 13:00):
+  1. **Fill-charge valt op morgen:** De goedkoopste slots liggen nu in de toekomst → vandaag stopt met laden.
+  2. **Ontlaaddrempel stijgt:** De drempel wordt berekend o.b.v. de goedkoopste *toekomstige* laadprijs, niet op basis van wat de opgeslagen energie **werkelijk** heeft gekost. Eerder goedkoop geladen energie wordt effectief "vergeten".
+  3. **Winstgevende intra-day cycli verdwijnen:** Arbitrage draaide NA fill → fill claimde de slots al.
+- **Gevolg:** Winstgevende ontlaadkwartieren worden overgeslagen; batterij stopt midden op de dag met laden.
+- **Fix (3 onderdelen):**
+  1. **Cost basis tracking:** Gewogen gemiddelde €/kWh van opgeslagen energie wordt bijgehouden en gepersisteerd in de SOC-cache. De ontlaaddrempel gebruikt `min(cost_basis, goedkoopste_toekomstige_laadprijs)` zodat goedkoop geladen energie niet wordt "vergeten" bij een prijsverversing.
+  2. **Arbitrage vóór fill:** Arbitrage-paren worden nu VÓÓR de fill-charge stap gezocht, zodat winstgevende intra-day cycli niet worden weggedrukt door goedkopere morgen-slots.
+  3. **Zonne-drempel verlaagd:** Van SOC ≥ 85% naar SOC ≥ 70%, zodat de batterij agressiever ontlaadt als er al voldoende energie is opgeslagen.
+- **Log:** `cost basis bijgewerkt → €X.XXXX/kWh` en `cost basis €X.XXXX < goedkoopste toekomstige €X.XXXX → lagere ontlaaddrempel`
+- **Diagnosekenmerk:** `/config/battery_manager_diag.txt` toont nu `effective_charge` en `cost_basis` in de header.
+
+---
+
 ## Hoe de logs lezen
 
 ### Optie A — HA UI (makkelijkst)
@@ -141,8 +156,8 @@ Herstart HA daarna. Dit maakt ook de `[EM-DEBUG]`-berichten zichtbaar (dezelfde 
 
 ## Standaard diagnosestappen
 
-1. **Controleer `/config/battery_manager_diag.txt`** — meest recente planner-output met SOC, drempels, n_charge, n_discharge en per-kwartier acties.
-2. **Controleer HA-logs** — zie "Hoe de logs lezen" hierboven. Zoek op `ACTIE GEWIJZIGD`, `GEBLOKKEERD`, `unavailable`, `uitgeschakeld`, `geslaagd`.
+1. **Controleer `/config/battery_manager_diag.txt`** — meest recente planner-output met SOC, drempels, cost basis, n_charge, n_discharge en per-kwartier acties.
+2. **Controleer HA-logs** — zie "Hoe de logs lezen" hierboven. Zoek op `ACTIE GEWIJZIGD`, `GEBLOKKEERD`, `unavailable`, `uitgeschakeld`, `geslaagd`, `cost basis`.
 3. **Als er géén battery_manager regels in de log staan:** de coordinator runt niet. Controleer of de integratie geladen is (`Instellingen → Integraties`) en herstart HA.
 4. **Controleer `sensor.battery_manager_current_action`** — toont de verwachte huidige actie.
 5. **Controleer of Zendure-entiteiten online zijn** in HA Developer Tools → States.
