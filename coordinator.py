@@ -15,7 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     DOMAIN,
     CONF_TIBBER_TOKEN, CONF_BATTERY_SOC,
-    CONF_P1_METER, CONF_VACATION,
+    CONF_P1_METER,
     CONF_BATTERY_MODE, CONF_BATTERY_CHARGE_LIMIT, CONF_BATTERY_DISCHARGE_LIMIT,
     CONF_MANAGE_BATTERY,
     DEFAULT_BATTERY_CAPACITY, DEFAULT_BATTERY_MAX_CHARGE, DEFAULT_BATTERY_MAX_DISCHARGE,
@@ -191,9 +191,8 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     self._save_soc_cache, self._last_known_soc
                 )
             p1             = self._safe_float(self._get_state(config[CONF_P1_METER]))
-            vacation       = self._get_state(config[CONF_VACATION]) == "on"
-            self._dbg("Sensoren: battery_soc=%.1f%%, p1=%.0f W, vacation=%s",
-                      battery_soc, p1, vacation)
+            self._dbg("Sensoren: battery_soc=%.1f%%, p1=%.0f W",
+                      battery_soc, p1)
 
             all_prices = prices_today + prices_tomorrow
 
@@ -220,7 +219,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             min_soc = self.entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC)
 
             schedule = self._create_schedule(
-                all_prices, battery_soc, p1, vacation, min_soc
+                all_prices, battery_soc, p1, min_soc
             )
 
             # Diagnosefile schrijven buiten event loop
@@ -252,7 +251,6 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 "all_prices": all_prices,
                 "battery_soc": battery_soc,
                 "p1": p1,
-                "vacation": vacation,
                 "schedule": schedule,
                 "chart_data": chart_data,
             }
@@ -874,7 +872,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning("battery_manager: batterij-aansturing mislukt: %s", err)
 
-    def _create_schedule(self, all_prices, battery_soc, p1, vacation, min_soc=DEFAULT_MIN_SOC):
+    def _create_schedule(self, all_prices, battery_soc, p1, min_soc=DEFAULT_MIN_SOC):
         """Look-ahead prijsplanner — kiest de goedkoopste kwartieren om te laden.
 
         Strategie — puur prijsgestuurd:
@@ -911,14 +909,22 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             else:
                 future.append(entry)
 
-        if vacation:
-            for e in future:
-                e['action'] = 'forced_off'
-            # Geen verdere planning nodig bij vakantie
-            return self._build_schedule_result(past, future, battery_soc, min_soc)
+        planning_future = [
+            e for e in future
+            if e['dt'] is None or e['dt'].date() == now_dt.date()
+        ]
+        future_later = [
+            e for e in future
+            if e['dt'] is not None and e['dt'].date() != now_dt.date()
+        ]
+
+        self._dbg(
+            "Planner horizon: vandaag=%d kwartieren, later=%d kwartieren",
+            len(planning_future), len(future_later),
+        )
 
         # ── Stap 1: negatieve/gratis prijs altijd all_on ─────────────────
-        for e in future:
+        for e in planning_future:
             if e['price'] is not None and e['price'] <= 0:
                 e['action'] = 'all_on'
 
@@ -962,7 +968,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
 
         # Genereer alle kandidaat-paren met hun winst
         _normal_with_price = [
-            e for e in future
+            e for e in planning_future
             if e['action'] == 'normal' and e['price'] is not None
         ]
         _candidate_pairs: list[tuple[float, dict, dict]] = []
@@ -983,7 +989,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         # Sorteer op winst (hoogste eerst) → greedy selectie
         _candidate_pairs.sort(key=lambda x: -x[0])
 
-        soc_at = _recompute_soc_at(future, battery_soc)
+        soc_at = _recompute_soc_at(planning_future, battery_soc)
 
         for _profit, _buy, _sell in _candidate_pairs:
             if len(_arb_pairs_list) >= max_arb_cycles:
@@ -1000,7 +1006,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             _arb_pairs_list.append((_buy, _sell))
             # Herbereken SOC na deze toewijzing zodat de volgende iteratie
             # juiste ruimte-check krijgt
-            soc_at = _recompute_soc_at(future, battery_soc)
+            soc_at = _recompute_soc_at(planning_future, battery_soc)
             self._dbg(
                 "Planner arbitrage: laden %s €%.4f → ontladen %s €%.4f (winst €%.4f/kWh input)",
                 _buy['starts_at'][11:16], _buy['price'],
@@ -1011,7 +1017,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         # ── Stap 3: vul de accu aan via de goedkoopste resterende slots ──
         # Arb-charges tellen NIET mee: die zijn voor een toekomstige cyclus
         # en mogen niet verhinderen dat de accu NU volgeladen wordt.
-        all_on_count = sum(1 for e in future if e['action'] == 'all_on')
+        all_on_count = sum(1 for e in planning_future if e['action'] == 'all_on')
         soc_from_planned = all_on_count * soc_per_charge_quarter
         soc_needed = max(0.0, DEFAULT_MAX_SOC - battery_soc - soc_from_planned)
         quarters_to_charge = int(soc_needed / soc_per_charge_quarter) + 1 if soc_needed > 0 else 0
@@ -1022,7 +1028,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         )
 
         candidates = [
-            e for e in future
+            e for e in planning_future
             if e['action'] == 'normal'
             and e['price'] is not None
         ]
@@ -1036,8 +1042,8 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             e['action'] = 'charge'
 
         # ── Stap 3b: simuleer verwachte SOC per kwartier ─────────────────
-        soc_at = _recompute_soc_at(future, battery_soc)
-        for e in future:
+        soc_at = _recompute_soc_at(planning_future, battery_soc)
+        for e in planning_future:
             e['_proj_soc'] = soc_at[e['idx']]
 
         # ── Stap 3c: verwijder overbodige laadsloten ─────────────────────
@@ -1051,11 +1057,11 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         _arb_charge_to_discharge = {buy['idx']: sell for buy, sell in _arb_pairs_list}
 
         charge_slots_desc = sorted(
-            [e for e in future if e['action'] == 'charge'],
+            [e for e in planning_future if e['action'] == 'charge'],
             key=lambda x: -(x['price'] or 0),
         )
         for e in charge_slots_desc:
-            soc_check = _recompute_soc_at(future, battery_soc)
+            soc_check = _recompute_soc_at(planning_future, battery_soc)
             slot_soc = soc_check.get(e['idx'], 0)
             if slot_soc >= DEFAULT_MAX_SOC - 0.1:
                 e['action'] = 'normal'
@@ -1073,8 +1079,8 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     )
 
         # Herbereken na cleanup voor de ontlaadplanning
-        soc_at = _recompute_soc_at(future, battery_soc)
-        for e in future:
+        soc_at = _recompute_soc_at(planning_future, battery_soc)
+        for e in planning_future:
             e['_proj_soc'] = soc_at[e['idx']]
 
         # ── Stap 4: duurste kwartieren ontladen ──────────────────────────
@@ -1088,19 +1094,19 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         # wanneer nieuwe prijsdata binnenkomt en de toekomstige laadprijzen
         # hoger liggen dan wat eerder betaald is.
         avg_price = (
-            sum(e['price'] for e in future if e['price'] is not None) /
-            max(1, sum(1 for e in future if e['price'] is not None))
+            sum(e['price'] for e in planning_future if e['price'] is not None) /
+            max(1, sum(1 for e in planning_future if e['price'] is not None))
         )
         # Goedkoopste prijs waartegen we energie ZOUDEN KUNNEN kopen
         # (niet alleen slots die al aan laden zijn toegewezen).
         # Dit voorkomt dat de ontlaaddrempel onrealistisch hoog wordt
         # wanneer er geen laadsloten gepland zijn (bijv. accu al vol).
         cheapest_available_price = min(
-            (e['price'] for e in future if e['price'] is not None),
+            (e['price'] for e in planning_future if e['price'] is not None),
             default=avg_price,
         )
         cheapest_charge_price = min(
-            (e['price'] for e in future
+            (e['price'] for e in planning_future
              if e['action'] in ('charge', 'all_on') and e['price'] is not None),
             default=cheapest_available_price,
         )
@@ -1120,14 +1126,14 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             / (DEFAULT_CHARGE_EFFICIENCY ** 2)
         )
 
-        already_discharge = sum(1 for e in future if e['action'] == 'discharge')
+        already_discharge = sum(1 for e in planning_future if e['action'] == 'discharge')
 
         # ── Stap 4: ontladen bij dure kwartieren (greedy + SOC-sim) ────────
         # Kandidaten worden één voor één toegewezen, puur op prijs
         # (duurste eerst), zonder voorkeur voor vandaag of morgen.
         # Na elke toewijzing: volledige SOC-sim check.
         discharge_candidates = [
-            e for e in future
+            e for e in planning_future
             if e['action'] == 'normal' and e['price'] is not None
             and e['price'] > discharge_threshold
         ]
@@ -1138,7 +1144,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         def _soc_sim_feasible() -> bool:
             """Retourneer True als de huidige actieset nergens SOC < min_soc veroorzaakt."""
             s = battery_soc
-            for fe in future:
+            for fe in planning_future:
                 fa = fe['action']
                 if fa in ('charge', 'all_on'):
                     s = min(DEFAULT_MAX_SOC, s + soc_per_charge_quarter)
@@ -1160,12 +1166,12 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             effective_charge_price,
             f"€{self._effective_charge_price:.4f}" if self._effective_charge_price is not None else "n/a",
             discharge_threshold,
-            already_discharge, sum(1 for e in future if e['action'] == 'discharge') - already_discharge,
+            already_discharge, sum(1 for e in planning_future if e['action'] == 'discharge') - already_discharge,
         )
 
         # ── Diagnose schrijven NA alle correcties ─────────────────────────
-        n_charge    = sum(1 for e in future if e['action'] in ('charge', 'all_on'))
-        n_discharge = sum(1 for e in future if e['action'] == 'discharge')
+        n_charge    = sum(1 for e in planning_future if e['action'] in ('charge', 'all_on'))
+        n_discharge = sum(1 for e in planning_future if e['action'] == 'discharge')
         _LOGGER.info(
             "battery_manager planner: SOC=%.1f%% | laden=%d | ontladen=%d | eff_laad=€%.4f | drempel=€%.4f | cost_basis=%s",
             battery_soc, n_charge, n_discharge, effective_charge_price, discharge_threshold,
@@ -1179,9 +1185,9 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 f"discharge_threshold=€{discharge_threshold:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
                 f"quarters_to_charge={quarters_to_charge}  arb_pairs={len(_arb_pairs_list)}  max_arb={max_arb_cycles}  arb_discharge_kept={already_discharge}",
                 f"n_charge={n_charge}  n_discharge={n_discharge}",
-                "--- toekomstige acties (na alle correcties) ---",
+                "--- toekomstige acties vandaag (na alle correcties) ---",
             ]
-            for e in future:
+            for e in planning_future:
                 t = e.get('starts_at', '')
                 try:
                     t_short = t[11:16]
@@ -1192,11 +1198,24 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     if e['price'] is not None else
                     f"  {t_short}  None  {e['action']}"
                 )
+            if future_later:
+                diag_lines.append("--- latere kwartieren buiten planningshorizon ---")
+                for e in future_later:
+                    t = e.get('starts_at', '')
+                    try:
+                        t_short = t[11:16]
+                    except Exception:
+                        t_short = t
+                    diag_lines.append(
+                        f"  {t_short}  €{e['price']:.4f}  {e['action']}"
+                        if e['price'] is not None else
+                        f"  {t_short}  None  {e['action']}"
+                    )
             self._pending_diag = "\n".join(diag_lines)
         except Exception:
             self._pending_diag = None
 
-        return self._build_schedule_result(past, future, battery_soc, min_soc)
+        return self._build_schedule_result(past, planning_future + future_later, battery_soc, min_soc)
 
     def _build_schedule_result(self, past, future, battery_soc, min_soc):
         """Combineer past + future tot een schedule-lijst met gesimuleerde SOC."""

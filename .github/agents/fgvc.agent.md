@@ -17,7 +17,6 @@ En; number.solarflow_2400_ac_output_limit van 0 tot 800
 
 Variabelen
 -prijzen vooruit tibber 'sensor.tibber_prices_quarterly','tomorrow'
--vacation, boolean; on = niemand thuis, weinig stroom gebruik
 
 
 Regels

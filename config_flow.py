@@ -10,7 +10,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import (
     DOMAIN,
     CONF_TIBBER_TOKEN, CONF_BATTERY_SOC,
-    CONF_P1_METER, CONF_VACATION,
+    CONF_P1_METER,
     CONF_BATTERY_MODE, CONF_BATTERY_CHARGE_LIMIT, CONF_BATTERY_DISCHARGE_LIMIT,
     CONF_MANAGE_BATTERY,
     CONF_DEBUG_LOGGING, CONF_MIN_SOC,
@@ -23,7 +23,6 @@ STEP_SENSORS_SCHEMA = vol.Schema({
     vol.Required(CONF_TIBBER_TOKEN): selector.selector({"text": {"type": "password"}}),
     vol.Required(CONF_BATTERY_SOC, default="sensor.solarflow_2400_ac_electric_level"): selector.selector({"entity": {"domain": "sensor"}}),
     vol.Required(CONF_P1_METER, default="sensor.p1_meter_actueel_watts"): selector.selector({"entity": {"domain": "sensor"}}),
-    vol.Required(CONF_VACATION, default="input_boolean.vacation"): selector.selector({"entity": {"domain": "input_boolean"}}),
 })
 
 STEP_DEVICES_SCHEMA = vol.Schema({
