@@ -13,6 +13,7 @@ DEFAULT_MAX_SOC = 100
 # Price threshold defaults
 DEFAULT_CHEAP_FACTOR = 0.85
 DEFAULT_EXPENSIVE_FACTOR = 1.05  # Ruimere ontlaad-drempel (was 1.15)
+DEFAULT_FEED_IN_COST = 0.00      # €/kWh kosten bij netto-teruglevering
 
 # Options-flow keys (aanpasbaar zonder herinstallatie)
 CONF_MIN_SOC = "min_soc"

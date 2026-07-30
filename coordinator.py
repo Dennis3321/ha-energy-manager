@@ -21,6 +21,7 @@ from .const import (
     DEFAULT_BATTERY_CAPACITY, DEFAULT_BATTERY_MAX_CHARGE, DEFAULT_BATTERY_MAX_DISCHARGE,
     DEFAULT_CHARGE_EFFICIENCY, DEFAULT_MIN_SOC, DEFAULT_MAX_SOC,
     DEFAULT_BATTERY_COST, DEFAULT_BATTERY_CYCLES,
+    DEFAULT_FEED_IN_COST,
     CONF_DEBUG_LOGGING, CONF_MIN_SOC,
 )
 
@@ -873,20 +874,15 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("battery_manager: batterij-aansturing mislukt: %s", err)
 
     def _create_schedule(self, all_prices, battery_soc, p1, min_soc=DEFAULT_MIN_SOC):
-        """Look-ahead prijsplanner — kiest de goedkoopste kwartieren om te laden.
+        """Dagplanner: maximaliseer euro-winst op basis van prijs, efficiëntie en afschrijving.
 
-        Strategie — puur prijsgestuurd:
-          1. Negatieve/gratis prijs  → all_on (altijd laden)
-          2. Bereken hoeveel kWh nodig om accu van huidige SOC naar MAX_SOC te brengen
-          3. Sorteer toekomstige kwartieren op prijs (goedkoopste eerst)
-          4. Ken 'charge' toe aan exact genoeg kwartieren om de accu vol te krijgen
-          5. Sorteer op prijs (duurste eerst), ken 'discharge' toe zolang
-             prijs > gemiddeld + afschrijving EN accu niet te leeg raakt
-          6. Chronologische SOC-check: annuleer ontladen dat de accu onder min_soc brengt
+        Regels uit SPEC:
+          1. Alleen huidige dag plannen.
+          2. Prijs is enige motivatie (incl. efficiëntie, afschrijving, terugleverkosten).
+          3. Voor negatieve prijsperioden accu zo leeg mogelijk maken om laadruimte te creëren.
         """
         now_dt = datetime.now()
 
-        # ── Splits verleden / toekomst ───────────────────────────────────
         past = []
         future = []
         for i, quarter in enumerate(all_prices):
@@ -904,7 +900,6 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                      'price': quarter.get('total'), 'action': 'normal'}
 
             if dt_local is not None and dt_local < now_dt - timedelta(minutes=15):
-                entry['action'] = 'normal'
                 past.append(entry)
             else:
                 future.append(entry)
@@ -923,19 +918,27 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             len(planning_future), len(future_later),
         )
 
-        # ── Stap 1: negatieve/gratis prijs altijd all_on ─────────────────
-        for e in planning_future:
-            if e['price'] is not None and e['price'] <= 0:
-                e['action'] = 'all_on'
+        if not planning_future:
+            self._pending_diag = None
+            return self._build_schedule_result(past, future_later, battery_soc, min_soc)
 
-        # ── Stap 2: bereken laad-/ontlaadcapaciteit ─────────────────────
         kwh_per_quarter_charge = (DEFAULT_BATTERY_MAX_CHARGE / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
         soc_per_charge_quarter = (kwh_per_quarter_charge / DEFAULT_BATTERY_CAPACITY) * 100
         kwh_per_quarter_discharge = (DEFAULT_BATTERY_MAX_DISCHARGE / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
         soc_per_discharge_quarter = (kwh_per_quarter_discharge / DEFAULT_BATTERY_CAPACITY) * 100
+        eta = DEFAULT_CHARGE_EFFICIENCY
+        feed_in_cost = DEFAULT_FEED_IN_COST
+
+        prices_today = [e['price'] for e in planning_future if e['price'] is not None]
+        cheapest_today = min(prices_today) if prices_today else 0.0
+        effective_source_price = (
+            self._effective_charge_price
+            if self._effective_charge_price is not None
+            else cheapest_today
+        )
 
         def _recompute_soc_at(future_list, start_soc):
-            """Helper: bereken SOC aan begin van elk kwartier op basis van huidige acties."""
+            """Bereken SOC aan begin van elk kwartier op basis van huidige acties."""
             soc_map: dict[int, float] = {}
             s = start_soc
             for fe in future_list:
@@ -947,199 +950,6 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 else:
                     s = max(0.0, s - 0.05)
             return soc_map
-
-        # ── Stap 2.5: ARBITRAGE — vind rendabele laad/ontlaad-paren ────────
-        # Strategie: genereer ALLE kandidaat-paren, sorteer op winst
-        # (hoogste eerst), en selecteer greedy met capaciteitscheck.
-        #
-        # Break-even formule (per kWh ingekocht van net):
-        #   P_sell × η² > P_buy + η × afschrijving
-        #   => P_sell > (P_buy + η × afschr) / η²
-        #
-        # Capaciteitsbeperking: de batterij kan maximaal
-        #   (MAX_SOC − min_soc) / soc_per_charge_quarter
-        # laad/ontlaad-cycli per 48u doen. Arbitrage mag hiervan maximaal
-        # de helft claimen, zodat fill-charge en losse ontladingen ook
-        # capaciteit houden.
-        max_arb_cycles = int((DEFAULT_MAX_SOC - min_soc) / soc_per_charge_quarter) // 2
-
-        _arb_used: set[int] = set()
-        _arb_pairs_list: list[tuple] = []  # (buy_entry, sell_entry) — voor step 3c cleanup
-
-        # Genereer alle kandidaat-paren met hun winst
-        _normal_with_price = [
-            e for e in planning_future
-            if e['action'] == 'normal' and e['price'] is not None
-        ]
-        _candidate_pairs: list[tuple[float, dict, dict]] = []
-        for _buy in _normal_with_price:
-            _breakeven = (_buy['price'] + DEFAULT_CHARGE_EFFICIENCY * BATTERY_DEPRECIATION) / (DEFAULT_CHARGE_EFFICIENCY ** 2)
-            for _sell in _normal_with_price:
-                if _sell['idx'] <= _buy['idx']:
-                    continue
-                if _sell['price'] <= _breakeven:
-                    continue
-                _profit = (
-                    _sell['price'] * DEFAULT_CHARGE_EFFICIENCY ** 2
-                    - _buy['price']
-                    - DEFAULT_CHARGE_EFFICIENCY * BATTERY_DEPRECIATION
-                )
-                _candidate_pairs.append((_profit, _buy, _sell))
-
-        # Sorteer op winst (hoogste eerst) → greedy selectie
-        _candidate_pairs.sort(key=lambda x: -x[0])
-
-        soc_at = _recompute_soc_at(planning_future, battery_soc)
-
-        for _profit, _buy, _sell in _candidate_pairs:
-            if len(_arb_pairs_list) >= max_arb_cycles:
-                break
-            if _buy['idx'] in _arb_used or _sell['idx'] in _arb_used:
-                continue
-            # Accu moet op het koopmoment ruimte hebben
-            if soc_at.get(_buy['idx'], 0) >= DEFAULT_MAX_SOC - 0.1:
-                continue
-            _buy['action'] = 'charge'
-            _sell['action'] = 'discharge'
-            _arb_used.add(_buy['idx'])
-            _arb_used.add(_sell['idx'])
-            _arb_pairs_list.append((_buy, _sell))
-            # Herbereken SOC na deze toewijzing zodat de volgende iteratie
-            # juiste ruimte-check krijgt
-            soc_at = _recompute_soc_at(planning_future, battery_soc)
-            self._dbg(
-                "Planner arbitrage: laden %s €%.4f → ontladen %s €%.4f (winst €%.4f/kWh input)",
-                _buy['starts_at'][11:16], _buy['price'],
-                _sell['starts_at'][11:16], _sell['price'],
-                _profit,
-            )
-
-        # ── Stap 3: vul de accu aan via de goedkoopste resterende slots ──
-        # Arb-charges tellen NIET mee: die zijn voor een toekomstige cyclus
-        # en mogen niet verhinderen dat de accu NU volgeladen wordt.
-        all_on_count = sum(1 for e in planning_future if e['action'] == 'all_on')
-        soc_from_planned = all_on_count * soc_per_charge_quarter
-        soc_needed = max(0.0, DEFAULT_MAX_SOC - battery_soc - soc_from_planned)
-        quarters_to_charge = int(soc_needed / soc_per_charge_quarter) + 1 if soc_needed > 0 else 0
-
-        self._dbg(
-            "Planner: SOC=%.1f%%, nodig=%.1f%% → %d fill-kwartieren (all_on=%d)",
-            battery_soc, soc_needed, quarters_to_charge, all_on_count,
-        )
-
-        candidates = [
-            e for e in planning_future
-            if e['action'] == 'normal'
-            and e['price'] is not None
-        ]
-        # Sorteer fill-candidates puur op prijs (laagste eerst),
-        # zonder voorkeur voor vandaag of morgen.
-        candidates_sorted_cheap = sorted(
-            candidates,
-            key=lambda e: (e['price'] if e['price'] is not None else float('inf')),
-        )
-        for e in candidates_sorted_cheap[:quarters_to_charge]:
-            e['action'] = 'charge'
-
-        # ── Stap 3b: simuleer verwachte SOC per kwartier ─────────────────
-        soc_at = _recompute_soc_at(planning_future, battery_soc)
-        for e in planning_future:
-            e['_proj_soc'] = soc_at[e['idx']]
-
-        # ── Stap 3c: verwijder overbodige laadsloten ─────────────────────
-        # Een laadslot is alleen overbodig als de accu op dat moment al
-        # (nagenoeg) vol is.  De oude peak-check verwijderde agressief
-        # laadsloten van vandaag omdat arb-charges morgen de piek-SOC
-        # hoog hielden — waardoor de accu vanavond te leeg was om te
-        # ontladen bij dure prijzen.
-
-        # Bouw lookup: charge-idx → paired discharge entry (voor orphan cleanup)
-        _arb_charge_to_discharge = {buy['idx']: sell for buy, sell in _arb_pairs_list}
-
-        charge_slots_desc = sorted(
-            [e for e in planning_future if e['action'] == 'charge'],
-            key=lambda x: -(x['price'] or 0),
-        )
-        for e in charge_slots_desc:
-            soc_check = _recompute_soc_at(planning_future, battery_soc)
-            slot_soc = soc_check.get(e['idx'], 0)
-            if slot_soc >= DEFAULT_MAX_SOC - 0.1:
-                e['action'] = 'normal'
-                self._dbg(
-                    "Planner 3c: overbodig laadslot verwijderd %s €%.4f (SOC al %.1f%%)",
-                    e['starts_at'][11:16], e['price'] or 0, slot_soc,
-                )
-                # Verwijder ook de gekoppelde ontlad-slot (orphan fix)
-                paired_discharge = _arb_charge_to_discharge.get(e['idx'])
-                if paired_discharge and paired_discharge['action'] == 'discharge':
-                    paired_discharge['action'] = 'normal'
-                    self._dbg(
-                        "Planner 3c: gekoppeld ontlaadslot ook verwijderd %s €%.4f",
-                        paired_discharge['starts_at'][11:16], paired_discharge['price'] or 0,
-                    )
-
-        # Herbereken na cleanup voor de ontlaadplanning
-        soc_at = _recompute_soc_at(planning_future, battery_soc)
-        for e in planning_future:
-            e['_proj_soc'] = soc_at[e['idx']]
-
-        # ── Stap 4: duurste kwartieren ontladen ──────────────────────────
-        # Drempel op basis van break-even formule.
-        #
-        # NIEUW: cost-basis-aware drempel.
-        # Als de accu al opgeslagen energie bevat (SOC > min_soc), is de
-        # effectieve laadprijs van die energie de cost basis (gewogen gem.
-        # van eerdere laadacties), niet de goedkoopste TOEKOMSTIGE laadprijs.
-        # Dit voorkomt dat winstgevende ontlaadkwartieren worden overgeslagen
-        # wanneer nieuwe prijsdata binnenkomt en de toekomstige laadprijzen
-        # hoger liggen dan wat eerder betaald is.
-        avg_price = (
-            sum(e['price'] for e in planning_future if e['price'] is not None) /
-            max(1, sum(1 for e in planning_future if e['price'] is not None))
-        )
-        # Goedkoopste prijs waartegen we energie ZOUDEN KUNNEN kopen
-        # (niet alleen slots die al aan laden zijn toegewezen).
-        # Dit voorkomt dat de ontlaaddrempel onrealistisch hoog wordt
-        # wanneer er geen laadsloten gepland zijn (bijv. accu al vol).
-        cheapest_available_price = min(
-            (e['price'] for e in planning_future if e['price'] is not None),
-            default=avg_price,
-        )
-        cheapest_charge_price = min(
-            (e['price'] for e in planning_future
-             if e['action'] in ('charge', 'all_on') and e['price'] is not None),
-            default=cheapest_available_price,
-        )
-
-        # Bepaal effectieve laadprijs: gebruik cost basis als die lager is
-        effective_charge_price = cheapest_charge_price
-        if self._effective_charge_price is not None and battery_soc > min_soc + soc_per_discharge_quarter:
-            effective_charge_price = min(cheapest_charge_price, self._effective_charge_price)
-            if effective_charge_price < cheapest_charge_price:
-                self._dbg(
-                    "Planner: cost basis €%.4f < goedkoopste toekomstige €%.4f → lagere ontlaaddrempel",
-                    self._effective_charge_price, cheapest_charge_price,
-                )
-
-        discharge_threshold = (
-            (effective_charge_price + DEFAULT_CHARGE_EFFICIENCY * BATTERY_DEPRECIATION)
-            / (DEFAULT_CHARGE_EFFICIENCY ** 2)
-        )
-
-        already_discharge = sum(1 for e in planning_future if e['action'] == 'discharge')
-
-        # ── Stap 4: ontladen bij dure kwartieren (greedy + SOC-sim) ────────
-        # Kandidaten worden één voor één toegewezen, puur op prijs
-        # (duurste eerst), zonder voorkeur voor vandaag of morgen.
-        # Na elke toewijzing: volledige SOC-sim check.
-        discharge_candidates = [
-            e for e in planning_future
-            if e['action'] == 'normal' and e['price'] is not None
-            and e['price'] > discharge_threshold
-        ]
-        discharge_candidates.sort(
-            key=lambda e: -(e['price'] if e['price'] is not None else 0)
-        )
 
         def _soc_sim_feasible() -> bool:
             """Retourneer True als de huidige actieset nergens SOC < min_soc veroorzaakt."""
@@ -1156,34 +966,118 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     s = max(0.0, s - 0.05)
             return True
 
+        def _pair_profit(buy_price: float, sell_price: float) -> float:
+            """Winst per ingekochte kWh, inclusief efficiëntie, afschrijving en terugleverkosten."""
+            effective_sell = max(0.0, sell_price - feed_in_cost)
+            return effective_sell * (eta ** 2) - buy_price - eta * BATTERY_DEPRECIATION
+
+        # Stap 1: negatieve prijzen altijd laden.
+        negative_slots = [
+            e for e in planning_future
+            if e['price'] is not None and e['price'] < 0
+        ]
+        for e in negative_slots:
+            e['action'] = 'all_on'
+
+        # Stap 2: vóór eerste negatieve slot ruimte maken door te ontladen.
+        first_negative_idx = min((e['idx'] for e in negative_slots), default=None)
+        room_bonus = abs(min((e['price'] for e in negative_slots), default=0.0)) * (eta ** 2)
+        forced_pre_negative = 0
+        if first_negative_idx is not None:
+            pre_negative_candidates = [
+                e for e in planning_future
+                if e['action'] == 'normal'
+                and e['price'] is not None
+                and e['idx'] < first_negative_idx
+            ]
+            pre_negative_candidates.sort(key=lambda x: -(x['price'] or 0))
+            for candidate in pre_negative_candidates:
+                discharge_profit = _pair_profit(effective_source_price, candidate['price'])
+                if discharge_profit + room_bonus <= 0:
+                    continue
+                candidate['action'] = 'discharge'
+                if _soc_sim_feasible():
+                    forced_pre_negative += 1
+                else:
+                    candidate['action'] = 'normal'
+
+        # Stap 3: arbitrageparen binnen de dag, op hoogste winst eerst.
+        used_indices: set[int] = set()
+        arb_pairs: list[tuple[dict, dict, float]] = []
+        pair_candidates: list[tuple[float, dict, dict]] = []
+        normal_with_price = [
+            e for e in planning_future
+            if e['action'] == 'normal' and e['price'] is not None
+        ]
+        for buy in normal_with_price:
+            for sell in normal_with_price:
+                if sell['idx'] <= buy['idx']:
+                    continue
+                profit = _pair_profit(buy['price'], sell['price'])
+                if profit <= 0:
+                    continue
+                pair_candidates.append((profit, buy, sell))
+        pair_candidates.sort(key=lambda x: -x[0])
+
+        for profit, buy, sell in pair_candidates:
+            if buy['idx'] in used_indices or sell['idx'] in used_indices:
+                continue
+            soc_before = _recompute_soc_at(planning_future, battery_soc)
+            if soc_before.get(buy['idx'], 0.0) >= DEFAULT_MAX_SOC - 0.1:
+                continue
+            buy['action'] = 'charge'
+            sell['action'] = 'discharge'
+            if _soc_sim_feasible():
+                used_indices.add(buy['idx'])
+                used_indices.add(sell['idx'])
+                arb_pairs.append((buy, sell, profit))
+            else:
+                buy['action'] = 'normal'
+                sell['action'] = 'normal'
+
+        # Stap 4: extra ontladen van bestaande energie als dat winstgevend is.
+        discharge_threshold = (
+            (effective_source_price + eta * BATTERY_DEPRECIATION)
+            / (eta ** 2)
+        ) + feed_in_cost
+        additional_discharge = 0
+        discharge_candidates = [
+            e for e in planning_future
+            if e['action'] == 'normal' and e['price'] is not None
+            and e['price'] > discharge_threshold
+        ]
+        discharge_candidates.sort(key=lambda x: -(x['price'] or 0))
         for candidate in discharge_candidates:
             candidate['action'] = 'discharge'
-            if not _soc_sim_feasible():
-                candidate['action'] = 'normal'  # past niet, terugdraaien
+            if _soc_sim_feasible():
+                additional_discharge += 1
+            else:
+                candidate['action'] = 'normal'
+
+        n_charge = sum(1 for e in planning_future if e['action'] in ('charge', 'all_on'))
+        n_discharge = sum(1 for e in planning_future if e['action'] == 'discharge')
+        est_pair_profit = sum(p for _, _, p in arb_pairs)
 
         self._dbg(
-            "Planner: eff_laadprijs=€%.4f (cost_basis=%s), drempel=€%.4f, arb_discharge=%d, nieuwe_kandidaten=%d",
-            effective_charge_price,
+            "Planner dagmodus: source=€%.4f (cost_basis=%s), feed=€%.4f, drempel=€%.4f, neg=%d, pre_neg_discharge=%d, pairs=%d, extra_discharge=%d",
+            effective_source_price,
             f"€{self._effective_charge_price:.4f}" if self._effective_charge_price is not None else "n/a",
+            feed_in_cost,
             discharge_threshold,
-            already_discharge, sum(1 for e in planning_future if e['action'] == 'discharge') - already_discharge,
+            len(negative_slots), forced_pre_negative, len(arb_pairs), additional_discharge,
         )
 
-        # ── Diagnose schrijven NA alle correcties ─────────────────────────
-        n_charge    = sum(1 for e in planning_future if e['action'] in ('charge', 'all_on'))
-        n_discharge = sum(1 for e in planning_future if e['action'] == 'discharge')
         _LOGGER.info(
-            "battery_manager planner: SOC=%.1f%% | laden=%d | ontladen=%d | eff_laad=€%.4f | drempel=€%.4f | cost_basis=%s",
-            battery_soc, n_charge, n_discharge, effective_charge_price, discharge_threshold,
-            f"€{self._effective_charge_price:.4f}" if self._effective_charge_price is not None else "n/a",
+            "battery_manager planner: SOC=%.1f%% | laden=%d | ontladen=%d | source=€%.4f | drempel=€%.4f | feed=€%.4f | pairs=%d",
+            battery_soc, n_charge, n_discharge, effective_source_price, discharge_threshold, feed_in_cost, len(arb_pairs),
         )
         try:
             diag_lines = [
                 f"=== battery_manager planner {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===",
                 f"SOC={battery_soc:.1f}%  min_soc={min_soc}%",
-                f"effective_charge=€{effective_charge_price:.4f}  cost_basis={'€'+format(self._effective_charge_price,'.4f') if self._effective_charge_price is not None else 'n/a'}",
-                f"discharge_threshold=€{discharge_threshold:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
-                f"quarters_to_charge={quarters_to_charge}  arb_pairs={len(_arb_pairs_list)}  max_arb={max_arb_cycles}  arb_discharge_kept={already_discharge}",
+                f"source_price=€{effective_source_price:.4f}  cost_basis={'€'+format(self._effective_charge_price,'.4f') if self._effective_charge_price is not None else 'n/a'}",
+                f"discharge_threshold=€{discharge_threshold:.4f}  feed_in=€{feed_in_cost:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
+                f"negative_slots={len(negative_slots)}  pre_negative_discharge={forced_pre_negative}  arb_pairs={len(arb_pairs)}  est_pair_profit={est_pair_profit:.4f}",
                 f"n_charge={n_charge}  n_discharge={n_discharge}",
                 "--- toekomstige acties vandaag (na alle correcties) ---",
             ]
