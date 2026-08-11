@@ -6,7 +6,7 @@ import json
 import logging
 import shutil
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
@@ -269,7 +269,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     #     action: charge      # of: discharge / normal / all_on
     async def _handle_force_action(call):
         action = call.data.get("action", "normal")
-        _LOGGER.warning("battery_manager: force_action aangeroepen met actie='%s'", action)
+        minutes = int(call.data.get("minutes", 20))
+        if minutes < 1:
+            minutes = 1
+        coordinator._manual_override_action = action
+        coordinator._manual_override_until = datetime.now() + timedelta(minutes=minutes)
+        _LOGGER.warning(
+            "battery_manager: force_action aangeroepen met actie='%s' (override %d min, tot %s)",
+            action,
+            minutes,
+            coordinator._manual_override_until.strftime("%H:%M:%S"),
+        )
         now_iso = datetime.now().replace(second=0, microsecond=0).isoformat()
         synthetic_schedule = [{
             "quarter": 0,

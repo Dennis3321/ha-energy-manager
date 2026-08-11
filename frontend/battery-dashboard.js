@@ -85,8 +85,18 @@ class BatteryDashboardCard extends HTMLElement {
       // Toch doorgaan met tekenen zodat de SOC-lijn zichtbaar is
     }
 
-    // Quick content-hash to skip unnecessary re-renders
-    const hash = `${chartData.length}|${chartData[0]?.starts_at}|${chartData[0]?.price}`;
+    // Quick content-hash to skip unnecessary re-renders.
+    // Hash the full payload so changes later in the 48h window still redraw.
+    const hash = JSON.stringify(
+      chartData.map((d) => [
+        d?.starts_at ?? null,
+        d?.price ?? null,
+        d?.action ?? null,
+        d?.battery_soc ?? null,
+        d?.battery_flow_w ?? null,
+        d?.savings_delta ?? null,
+      ])
+    );
     if (hash === this._lastHash) return;
 
     // Update "last updated" timestamp
@@ -241,7 +251,9 @@ class BatteryDashboardCard extends HTMLElement {
         return;
       }
       // Defensive: check for required fields in at least one data point
-      const hasValid = data.some(d => d && typeof d === 'object' && 'price' in d && 'time' in d);
+      const hasValid = data.some(
+        d => d && typeof d === 'object' && 'price' in d && ('time' in d || 'starts_at' in d || 'startsAt' in d)
+      );
       if (!hasValid) {
         this._showMessage("Dataformaat ongeldig — controleer sensor output.");
         return;
@@ -262,14 +274,15 @@ class BatteryDashboardCard extends HTMLElement {
     let nowIndex = 0;
     let minDiff = Infinity;
     data.forEach((d, i) => {
-      if (d.starts_at) {
-        const diff = Math.abs(new Date(d.starts_at).getTime() - now);
+      const startsAt = d?.starts_at ?? d?.startsAt ?? null;
+      if (startsAt) {
+        const diff = Math.abs(new Date(startsAt).getTime() - now);
         if (diff < minDiff) { minDiff = diff; nowIndex = i; }
       }
     });
 
     // X-axis labels: show every 2 uur (elke 8 kwartieren); eerste item altijd tonen
-    const labels = data.map((d, i) => (i === 0 || i % 8 === 0 ? d.time : ""));
+    const labels = data.map((d, i) => (i === 0 || i % 8 === 0 ? (d.time ?? d.starts_at ?? d.startsAt ?? "") : ""));
 
     const prices = data.map((d) => (d.price != null ? +d.price : null));
     // gebruik verwijderd

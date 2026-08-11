@@ -4,6 +4,7 @@ import asyncio
 
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -73,6 +74,299 @@ _WEEKDAYS_NL = ["ma", "di", "wo", "do", "vr", "za", "zo"]
 
 class BatteryManagerCoordinator(DataUpdateCoordinator):
 
+    @staticmethod
+    def _extract_max_from_range_error(exc: Exception) -> float | None:
+        """Try to extract an allowed max value from common HA range errors.
+
+        Example messages seen in the wild:
+        - "value must be at most 800"
+        - "outside valid range 0 - 800"
+        - "expected value between 0 and 800"
+        """
+        text = str(exc).lower()
+
+        patterns = [
+            r"at most\s+(-?\d+(?:\.\d+)?)",
+            r"max(?:imum)?\s*(?:is|=)?\s*(-?\d+(?:\.\d+)?)",
+            r"between\s+-?\d+(?:\.\d+)?\s+and\s+(-?\d+(?:\.\d+)?)",
+            r"range\s*-?\d+(?:\.\d+)?\s*[-:]\s*(-?\d+(?:\.\d+)?)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            try:
+                return float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _resolve_mode_option(self, mode_entity: str, requested: str) -> str:
+        """Resolve logical mode (input/output) to an actual select option value.
+
+        Some Zendure integrations expose localized or verbose option labels
+        (for example "AC Output Mode") instead of plain "output".
+        """
+        st = self.hass.states.get(mode_entity)
+        options = []
+        if st is not None:
+            raw_options = st.attributes.get("options", [])
+            if isinstance(raw_options, list):
+                options = [str(o) for o in raw_options]
+
+        if not options:
+            return requested
+
+        requested_l = requested.lower()
+        options_l = {opt.lower(): opt for opt in options}
+
+        # 1) Exact case-insensitive match.
+        if requested_l in options_l:
+            return options_l[requested_l]
+
+        if requested_l == "input":
+            candidates = [
+                "ac input mode", "input mode", "ac input", "input", "charge", "charging",
+            ]
+        elif requested_l == "output":
+            candidates = [
+                "ac output mode", "output mode", "ac output", "output", "discharge", "discharging",
+            ]
+        else:
+            candidates = [requested_l]
+
+        # 2) Preferred aliases first.
+        for alias in candidates:
+            if alias in options_l:
+                return options_l[alias]
+
+        # 3) Fuzzy containment fallback.
+        for opt in options:
+            lo = opt.lower()
+            if requested_l == "input" and ("input" in lo or "charge" in lo):
+                return opt
+            if requested_l == "output" and ("output" in lo or "discharge" in lo):
+                return opt
+
+        _LOGGER.warning(
+            "battery_manager: geen match voor mode '%s' in options %s, fallback op '%s'",
+            requested,
+            options,
+            requested,
+        )
+        return requested
+
+    @staticmethod
+    def _guess_soc_target_entity(mode_entity: str) -> str | None:
+        """Best-effort mapping from AC mode select to Zendure Target SoC number entity."""
+        if not mode_entity.startswith("select.") or not mode_entity.endswith("_ac_mode"):
+            return None
+        prefix = mode_entity[len("select.") : -len("_ac_mode")]
+        if not prefix:
+            return None
+        return f"number.{prefix}_soc_set"
+
+    def _clamp_to_number_entity(self, entity_id: str, requested: float) -> float:
+        """Clamp a requested number value to the entity's allowed min/max."""
+        st = self.hass.states.get(entity_id)
+        if st is None:
+            return requested
+
+        min_v = st.attributes.get("min")
+        max_v = st.attributes.get("max")
+        clamped = requested
+
+        try:
+            if min_v is not None:
+                clamped = max(clamped, float(min_v))
+            if max_v is not None:
+                clamped = min(clamped, float(max_v))
+        except (ValueError, TypeError):
+            return requested
+
+        if clamped != requested:
+            _LOGGER.warning(
+                "battery_manager: limiet geclamped voor %s: gevraagd=%.0fW, toegestaan=%.0fW (min=%s, max=%s)",
+                entity_id,
+                requested,
+                clamped,
+                min_v,
+                max_v,
+            )
+        return clamped
+
+    def _get_number_max(self, entity_id: str) -> float | None:
+        """Return current max attribute for a number entity, if available."""
+        st = self.hass.states.get(entity_id)
+        if st is None:
+            return None
+        try:
+            max_v = st.attributes.get("max")
+            return float(max_v) if max_v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    async def _try_mode_variants_for_power(
+        self,
+        mode_entity: str,
+        desired: str,
+        limit_entity: str,
+    ) -> str | None:
+        """Try alternative mode options until the target limit entity becomes writable."""
+        st = self.hass.states.get(mode_entity)
+        if st is None:
+            return None
+        raw_options = st.attributes.get("options", [])
+        if not isinstance(raw_options, list):
+            return None
+
+        options = [str(o) for o in raw_options]
+        desired_l = desired.lower()
+        if desired_l == "output":
+            candidates = [o for o in options if ("output" in o.lower() or "discharge" in o.lower())]
+        else:
+            candidates = [o for o in options if ("input" in o.lower() or "charge" in o.lower())]
+
+        # Keep order stable but deduplicate.
+        seen = set()
+        ordered_candidates = []
+        for c in candidates:
+            cl = c.lower()
+            if cl in seen:
+                continue
+            seen.add(cl)
+            ordered_candidates.append(c)
+
+        for candidate in ordered_candidates:
+            try:
+                await self.hass.services.async_call(
+                    "select", "select_option",
+                    {"entity_id": mode_entity, "option": candidate},
+                    blocking=True,
+                )
+            except Exception:
+                continue
+
+            await asyncio.sleep(1)
+            max_v = self._get_number_max(limit_entity)
+            if max_v is not None and max_v > 0:
+                _LOGGER.warning(
+                    "battery_manager: alternatieve mode gekozen voor %s: '%s' (max nu %.0f)",
+                    desired,
+                    candidate,
+                    max_v,
+                )
+                return candidate
+
+        return None
+
+    async def _wait_for_number_max_above_zero(self, entity_id: str, timeout_s: int = 12) -> bool:
+        """Wait until a number entity reports max > 0 (mode-dependent ranges)."""
+        deadline = datetime.now() + timedelta(seconds=timeout_s)
+        while datetime.now() < deadline:
+            max_v = self._get_number_max(entity_id)
+            if max_v is not None and max_v > 0:
+                return True
+            await asyncio.sleep(1)
+        max_v = self._get_number_max(entity_id)
+        return bool(max_v is not None and max_v > 0)
+
+    async def _attempt_upstream_recovery(
+        self,
+        mode_entity: str,
+        charge_entity: str,
+        discharge_entity: str,
+    ) -> bool:
+        """Try Home Assistant-side recovery when SolarFlow limit ranges are locked."""
+        now = datetime.now()
+        if self._last_upstream_recovery and (now - self._last_upstream_recovery) < timedelta(minutes=10):
+            _LOGGER.warning("battery_manager: upstream recovery overgeslagen (cooldown actief)")
+            return False
+        self._last_upstream_recovery = now
+
+        in_max_before = self._get_number_max(charge_entity) if charge_entity else None
+        out_max_before = self._get_number_max(discharge_entity) if discharge_entity else None
+        _LOGGER.warning(
+            "battery_manager: start upstream recovery (input max=%s, output max=%s)",
+            in_max_before,
+            out_max_before,
+        )
+
+        try:
+            prefix = None
+            if mode_entity.startswith("select.") and mode_entity.endswith("_ac_mode"):
+                prefix = mode_entity[len("select.") : -len("_ac_mode")]
+            if prefix:
+                connection_entity = f"select.{prefix}_connection"
+                st = self.hass.states.get(connection_entity)
+                if st is not None:
+                    opts = st.attributes.get("options", [])
+                    if isinstance(opts, list):
+                        options = [str(o) for o in opts]
+                        options_l = {o.lower(): o for o in options}
+                        if "cloud" in options_l and "zensdk" in options_l:
+                            cur = str(st.state).lower()
+                            first = options_l["cloud"] if cur != "cloud" else options_l["zensdk"]
+                            second = options_l["zensdk"] if first.lower() == "cloud" else options_l["cloud"]
+                            _LOGGER.warning(
+                                "battery_manager: upstream recovery toggle connection via %s: %s -> %s",
+                                connection_entity,
+                                first,
+                                second,
+                            )
+                            await self.hass.services.async_call(
+                                "select",
+                                "select_option",
+                                {"entity_id": connection_entity, "option": first},
+                                blocking=True,
+                            )
+                            await asyncio.sleep(3)
+                            await self.hass.services.async_call(
+                                "select",
+                                "select_option",
+                                {"entity_id": connection_entity, "option": second},
+                                blocking=True,
+                            )
+                            await asyncio.sleep(3)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("battery_manager: upstream recovery connection-toggle mislukt: %s", exc)
+
+        try:
+            entries = self.hass.config_entries.async_entries("zendure_ha")
+            for ent in entries:
+                _LOGGER.warning(
+                    "battery_manager: upstream recovery reload_config_entry voor zendure_ha entry_id=%s",
+                    ent.entry_id,
+                )
+                await self.hass.services.async_call(
+                    "homeassistant",
+                    "reload_config_entry",
+                    {"entry_id": ent.entry_id},
+                    blocking=True,
+                )
+            if entries:
+                await asyncio.sleep(8)
+        except Exception as exc:  # noqa: BLE001
+            _LOGGER.warning("battery_manager: upstream recovery reload mislukt: %s", exc)
+
+        in_max_after = self._get_number_max(charge_entity) if charge_entity else None
+        out_max_after = self._get_number_max(discharge_entity) if discharge_entity else None
+        recovered = bool((in_max_after is not None and in_max_after > 0) or (out_max_after is not None and out_max_after > 0))
+
+        if recovered:
+            _LOGGER.warning(
+                "battery_manager: upstream recovery geslaagd (input max=%s, output max=%s)",
+                in_max_after,
+                out_max_after,
+            )
+        else:
+            _LOGGER.error(
+                "battery_manager: upstream recovery zonder effect (input max=%s, output max=%s)",
+                in_max_after,
+                out_max_after,
+            )
+        return recovered
+
     def _get_dynamic_limits(self):
         """Lees de actuele laad- en ontlaadlimieten uit de entiteiten (indien beschikbaar)."""
         config = self.entry.data
@@ -121,6 +415,9 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         self._effective_charge_price: float | None = None  # gewogen gemiddelde €/kWh van opgeslagen energie
         self._soc_cache_loaded: bool = False
         self._price_cache_loaded: bool = False
+        self._last_upstream_recovery: datetime | None = None
+        self._manual_override_action: str | None = None
+        self._manual_override_until: datetime | None = None
 
     def _dbg(self, msg: str, *args) -> None:
         """Log at INFO level when debug_logging option is enabled."""
@@ -622,7 +919,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     best_slot = slot
         return best_slot
 
-    async def _apply_battery_control(self, schedule: list) -> None:
+    async def _apply_battery_control(self, schedule: list, _recovery_attempted: bool = False) -> None:
         """Stuur de Zendure-batterij aan op basis van het huidige kwartier.
 
         Entiteiten (geconfigureerd in de config-flow):
@@ -653,6 +950,21 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
 
         current_slot = self._find_current_action(schedule)
         action = current_slot.get("action", "normal")
+
+        now_local = datetime.now()
+        if self._manual_override_action and self._manual_override_until:
+            if now_local < self._manual_override_until:
+                action = self._manual_override_action
+                _LOGGER.warning(
+                    "battery_manager: manual override actief tot %s — geforceerde actie='%s'",
+                    self._manual_override_until.strftime("%H:%M:%S"),
+                    action,
+                )
+            else:
+                _LOGGER.info("battery_manager: manual override verlopen")
+                self._manual_override_action = None
+                self._manual_override_until = None
+
         slot_time = (current_slot.get("starts_at") or "")[11:16] or "onbekend"
         slot_price = current_slot.get("price")
         price_str = f"€{slot_price:.4f}/kWh" if slot_price is not None else "prijs onbekend"
@@ -709,10 +1021,33 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             charge_limit   = 0
             discharge_limit = 0
 
+        mode_option = self._resolve_mode_option(mode_entity, mode_option)
+        charge_limit = int(round(charge_limit))
+        discharge_limit = int(round(discharge_limit))
+
         _LOGGER.warning(
             "battery_manager: batterij actie '%s' -> mode=%s, laden=%dW, ontladen=%dW",
             action, mode_option, charge_limit, discharge_limit,
         )
+
+        # Diagnosehint: als hardware Target SoC < 100 is, lijkt laden te "werken"
+        # maar SOC stopt zichtbaar bij die grens (bijv. 85%).
+        if action in ("charge", "all_on"):
+            soc_target_entity = self._guess_soc_target_entity(mode_entity)
+            if soc_target_entity:
+                soc_target_state = self.hass.states.get(soc_target_entity)
+                if soc_target_state and soc_target_state.state not in ("unavailable", "unknown", "none", ""):
+                    try:
+                        soc_target = float(soc_target_state.state)
+                        if soc_target < 99.5:
+                            _LOGGER.warning(
+                                "battery_manager: Zendure Target SoC staat op %.1f%% (%s) — "
+                                "laden kan daardoor stoppen rond die waarde",
+                                soc_target,
+                                soc_target_entity,
+                            )
+                    except (TypeError, ValueError):
+                        pass
 
         # ── Cost basis bijwerken bij laden ────────────────────────────────
         # Gewogen gemiddelde €/kWh van opgeslagen energie, zodat de ontlaad-
@@ -774,26 +1109,8 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 )
                 return
 
-            # 1. Stel laad- en ontlaadlimiet in
-            if charge_entity:
-                _LOGGER.warning(
-                    "battery_manager: stel laadlimiet in → %s = %d W", charge_entity, charge_limit
-                )
-                await self.hass.services.async_call(
-                    "number", "set_value",
-                    {"entity_id": charge_entity, "value": charge_limit},
-                    blocking=True,
-                )
-            if discharge_entity:
-                _LOGGER.warning(
-                    "battery_manager: stel ontlaadlimiet in → %s = %d W", discharge_entity, discharge_limit
-                )
-                await self.hass.services.async_call(
-                    "number", "set_value",
-                    {"entity_id": discharge_entity, "value": discharge_limit},
-                    blocking=True,
-                )
-            # 2. Schakel modus (na de limieten, zodat de Zendure ze al kent)
+            # 1. Schakel eerst de modus; sommige Zendure number-entiteiten
+            #    accepteren pas een geldige range nadat de mode actief is.
             _LOGGER.warning(
                 "battery_manager: stel AC mode in → %s = '%s'", mode_entity, mode_option
             )
@@ -802,17 +1119,290 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 {"entity_id": mode_entity, "option": mode_option},
                 blocking=True,
             )
+
+            # Geef de Zendure-entiteiten kort de tijd om hun min/max-range
+            # aan te passen na de mode-wissel.
+            await asyncio.sleep(1)
+
+            # Wacht bij actieve laad/ontlaadacties tot de target-number range open staat.
+            if action == "discharge" and discharge_entity and DEFAULT_BATTERY_MAX_DISCHARGE > 0:
+                ready = await self._wait_for_number_max_above_zero(discharge_entity, timeout_s=12)
+                if not ready:
+                    _LOGGER.warning(
+                        "battery_manager: ontlaad-entiteit blijft geblokkeerd (max=0) na mode-switch, probeer mode-varianten"
+                    )
+            if action in ("charge", "all_on") and charge_entity and DEFAULT_BATTERY_MAX_CHARGE > 0:
+                ready = await self._wait_for_number_max_above_zero(charge_entity, timeout_s=12)
+                if not ready:
+                    _LOGGER.warning(
+                        "battery_manager: laad-entiteit blijft geblokkeerd (max=0) na mode-switch, probeer mode-varianten"
+                    )
+
+            # Clamp pas NA mode-wissel, omdat de toegestane range mode-afhankelijk is.
+            if charge_entity:
+                charge_limit = int(round(self._clamp_to_number_entity(charge_entity, float(charge_limit))))
+            if discharge_entity:
+                discharge_limit = int(round(self._clamp_to_number_entity(discharge_entity, float(discharge_limit))))
+
+            # Fallback: als mode op papier goed staat maar de target-limit nog max=0 heeft,
+            # probeer alternatieve mode-opties met output/input in de naam.
+            if action == "discharge" and discharge_entity and discharge_limit == 0 and DEFAULT_BATTERY_MAX_DISCHARGE > 0:
+                alt = await self._try_mode_variants_for_power(mode_entity, "output", discharge_entity)
+                if alt is not None:
+                    mode_option = alt
+                    discharge_limit = int(round(self._clamp_to_number_entity(discharge_entity, float(DEFAULT_BATTERY_MAX_DISCHARGE))))
+            if action in ("charge", "all_on") and charge_entity and charge_limit == 0 and DEFAULT_BATTERY_MAX_CHARGE > 0:
+                alt = await self._try_mode_variants_for_power(mode_entity, "input", charge_entity)
+                if alt is not None:
+                    mode_option = alt
+                    charge_limit = int(round(self._clamp_to_number_entity(charge_entity, float(DEFAULT_BATTERY_MAX_CHARGE))))
+
+            # Als entity max=0 blijft: skip set_value om niet actief 0W te forceren.
+            can_set_charge_limit = True
+            can_set_discharge_limit = True
+            # Sommige firmwares gebruiken effectief slechts 1 power-limiet entiteit
+            # afhankelijk van mode. In dat geval kan de "actieve" entiteit max=0
+            # blijven terwijl de andere wel schrijfbaar is.
+            discharge_via_charge_fallback = False
+            charge_via_discharge_fallback = False
+            if action == "discharge" and DEFAULT_BATTERY_MAX_DISCHARGE > 0 and discharge_limit <= 0:
+                can_set_discharge_limit = False
+                _LOGGER.warning(
+                    "battery_manager: ontlaadlimiet entity geblokkeerd (max=0); fallback=mode-only (geen 0W write)"
+                )
+                if charge_entity:
+                    alt_limit = int(round(self._clamp_to_number_entity(charge_entity, float(DEFAULT_BATTERY_MAX_DISCHARGE))))
+                    if alt_limit > 0:
+                        discharge_via_charge_fallback = True
+                        charge_limit = alt_limit
+                        can_set_charge_limit = True
+                        _LOGGER.warning(
+                            "battery_manager: ontladen fallback via %s = %dW (primaire ontlaad-entiteit geblokkeerd)",
+                            charge_entity,
+                            charge_limit,
+                        )
+            if action in ("charge", "all_on") and DEFAULT_BATTERY_MAX_CHARGE > 0 and charge_limit <= 0:
+                can_set_charge_limit = False
+                _LOGGER.warning(
+                    "battery_manager: laadlimiet entity geblokkeerd (max=0); fallback=mode-only (geen 0W write)"
+                )
+                if discharge_entity:
+                    alt_limit = int(round(self._clamp_to_number_entity(discharge_entity, float(DEFAULT_BATTERY_MAX_CHARGE))))
+                    if alt_limit > 0:
+                        charge_via_discharge_fallback = True
+                        discharge_limit = alt_limit
+                        can_set_discharge_limit = True
+                        _LOGGER.warning(
+                            "battery_manager: laden fallback via %s = %dW (primaire laad-entiteit geblokkeerd)",
+                            discharge_entity,
+                            discharge_limit,
+                        )
+
+            # Schrijf alleen de relevante limieten voor de gevraagde actie.
+            # Hiermee voorkomen we dat een gedeelde power-entiteit op 0W wordt gezet
+            # tijdens een actieve laad/ontlaadactie.
+            write_charge_limit = bool(charge_entity) and (
+                action in ("charge", "all_on", "normal") or discharge_via_charge_fallback
+            )
+            write_discharge_limit = bool(discharge_entity) and (
+                action in ("discharge", "normal") or charge_via_discharge_fallback
+            )
+
+            # Als er voor een actieve actie geen enkele writebare power-route is,
+            # dan kan de batterij fysiek niet laden/ontladen vanuit HA.
+            if action == "discharge":
+                can_apply_active_power = (
+                    (write_discharge_limit and can_set_discharge_limit and discharge_limit > 0)
+                    or (discharge_via_charge_fallback and write_charge_limit and can_set_charge_limit and charge_limit > 0)
+                )
+                if not can_apply_active_power:
+                    if not _recovery_attempted:
+                        recovered = await self._attempt_upstream_recovery(
+                            mode_entity, charge_entity, discharge_entity
+                        )
+                        if recovered:
+                            _LOGGER.warning(
+                                "battery_manager: retry batterij-aansturing na upstream recovery"
+                            )
+                            return await self._apply_battery_control(schedule, _recovery_attempted=True)
+                    _LOGGER.error(
+                        "battery_manager: ontladen NIET UITVOERBAAR — power limits blijven geblokkeerd "
+                        "(input max=%s, output max=%s, mode=%s). Controleer Zendure/SolarFlow status.",
+                        self._get_number_max(charge_entity) if charge_entity else None,
+                        self._get_number_max(discharge_entity) if discharge_entity else None,
+                        mode_option,
+                    )
+                    return
+            if action in ("charge", "all_on"):
+                can_apply_active_power = (
+                    (write_charge_limit and can_set_charge_limit and charge_limit > 0)
+                    or (charge_via_discharge_fallback and write_discharge_limit and can_set_discharge_limit and discharge_limit > 0)
+                )
+                if not can_apply_active_power:
+                    if not _recovery_attempted:
+                        recovered = await self._attempt_upstream_recovery(
+                            mode_entity, charge_entity, discharge_entity
+                        )
+                        if recovered:
+                            _LOGGER.warning(
+                                "battery_manager: retry batterij-aansturing na upstream recovery"
+                            )
+                            return await self._apply_battery_control(schedule, _recovery_attempted=True)
+                    _LOGGER.error(
+                        "battery_manager: laden NIET UITVOERBAAR — power limits blijven geblokkeerd "
+                        "(input max=%s, output max=%s, mode=%s). Controleer Zendure/SolarFlow status.",
+                        self._get_number_max(charge_entity) if charge_entity else None,
+                        self._get_number_max(discharge_entity) if discharge_entity else None,
+                        mode_option,
+                    )
+                    return
+
+            # 2. Stel daarna de laad- en ontlaadlimiet in
+            if write_charge_limit and can_set_charge_limit:
+                _LOGGER.warning(
+                    "battery_manager: stel laadlimiet in → %s = %d W", charge_entity, charge_limit
+                )
+                charge_set = False
+                for attempt in range(3):
+                    try:
+                        await self.hass.services.async_call(
+                            "number", "set_value",
+                            {"entity_id": charge_entity, "value": charge_limit},
+                            blocking=True,
+                        )
+                        charge_set = True
+                        break
+                    except Exception as exc:
+                        if "outside valid range" in str(exc) and attempt < 2:
+                            parsed_max = self._extract_max_from_range_error(exc)
+                            if parsed_max is not None:
+                                charge_limit = int(max(0, min(charge_limit, round(parsed_max))))
+                                _LOGGER.warning(
+                                    "battery_manager: laadlimiet range uit foutmelding afgeleid (max=%.0fW), retry %d/3",
+                                    parsed_max,
+                                    attempt + 2,
+                                )
+                            else:
+                                _LOGGER.warning(
+                                    "battery_manager: laadlimiet tijdelijk geweigerd (%s), retry %d/3",
+                                    exc,
+                                    attempt + 2,
+                                )
+                                charge_limit = int(round(self._clamp_to_number_entity(charge_entity, float(charge_limit))))
+                            await asyncio.sleep(1)
+                            continue
+                        if "at most" in str(exc).lower() and attempt < 2:
+                            parsed_max = self._extract_max_from_range_error(exc)
+                            if parsed_max is not None:
+                                charge_limit = int(max(0, min(charge_limit, round(parsed_max))))
+                                _LOGGER.warning(
+                                    "battery_manager: laadlimiet maximum uit foutmelding afgeleid (max=%.0fW), retry %d/3",
+                                    parsed_max,
+                                    attempt + 2,
+                                )
+                                await asyncio.sleep(1)
+                                continue
+                            _LOGGER.warning(
+                                "battery_manager: laadlimiet tijdelijk geweigerd (%s), retry %d/3",
+                                exc,
+                                attempt + 2,
+                            )
+                        raise
+                if not charge_set:
+                    raise RuntimeError("kon laadlimiet niet instellen")
+            elif charge_entity and write_charge_limit:
+                _LOGGER.warning(
+                    "battery_manager: laadlimiet write overgeslagen (entity range geblokkeerd)"
+                )
+            elif charge_entity:
+                _LOGGER.info(
+                    "battery_manager: laadlimiet write bewust overgeslagen voor actie '%s'",
+                    action,
+                )
+
+            if write_discharge_limit and can_set_discharge_limit:
+                _LOGGER.warning(
+                    "battery_manager: stel ontlaadlimiet in → %s = %d W", discharge_entity, discharge_limit
+                )
+                discharge_set = False
+                for attempt in range(3):
+                    try:
+                        await self.hass.services.async_call(
+                            "number", "set_value",
+                            {"entity_id": discharge_entity, "value": discharge_limit},
+                            blocking=True,
+                        )
+                        discharge_set = True
+                        break
+                    except Exception as exc:
+                        if "outside valid range" in str(exc) and attempt < 2:
+                            parsed_max = self._extract_max_from_range_error(exc)
+                            if parsed_max is not None:
+                                discharge_limit = int(max(0, min(discharge_limit, round(parsed_max))))
+                                _LOGGER.warning(
+                                    "battery_manager: ontlaadlimiet range uit foutmelding afgeleid (max=%.0fW), retry %d/3",
+                                    parsed_max,
+                                    attempt + 2,
+                                )
+                            else:
+                                _LOGGER.warning(
+                                    "battery_manager: ontlaadlimiet tijdelijk geweigerd (%s), retry %d/3",
+                                    exc,
+                                    attempt + 2,
+                                )
+                                discharge_limit = int(round(self._clamp_to_number_entity(discharge_entity, float(discharge_limit))))
+                            await asyncio.sleep(1)
+                            continue
+                        if "at most" in str(exc).lower() and attempt < 2:
+                            parsed_max = self._extract_max_from_range_error(exc)
+                            if parsed_max is not None:
+                                discharge_limit = int(max(0, min(discharge_limit, round(parsed_max))))
+                                _LOGGER.warning(
+                                    "battery_manager: ontlaadlimiet maximum uit foutmelding afgeleid (max=%.0fW), retry %d/3",
+                                    parsed_max,
+                                    attempt + 2,
+                                )
+                                await asyncio.sleep(1)
+                                continue
+                            _LOGGER.warning(
+                                "battery_manager: ontlaadlimiet tijdelijk geweigerd (%s), retry %d/3",
+                                exc,
+                                attempt + 2,
+                            )
+                        raise
+                if not discharge_set:
+                    raise RuntimeError("kon ontlaadlimiet niet instellen")
+            elif discharge_entity and write_discharge_limit:
+                _LOGGER.warning(
+                    "battery_manager: ontlaadlimiet write overgeslagen (entity range geblokkeerd)"
+                )
+            elif discharge_entity:
+                _LOGGER.info(
+                    "battery_manager: ontlaadlimiet write bewust overgeslagen voor actie '%s'",
+                    action,
+                )
             _LOGGER.warning("battery_manager: batterij-aansturing geslaagd: actie='%s'", action)
             self._last_applied_action = action
 
             # 3. Verificatie: wacht kort zodat Zendure MQTT-terugkoppeling verwerkt,
             #    lees dan de werkelijke waarden terug en log afwijkingen.
             await asyncio.sleep(2)
-            for _eid, _req, _label in [
-                (charge_entity,    charge_limit,    "laadlimiet"),
-                (discharge_entity, discharge_limit, "ontlaadlimiet"),
-            ]:
+            verify_targets = []
+            if write_charge_limit:
+                verify_targets.append((charge_entity, charge_limit, "laadlimiet"))
+            if write_discharge_limit:
+                verify_targets.append((discharge_entity, discharge_limit, "ontlaadlimiet"))
+
+            for _eid, _req, _label in verify_targets:
                 if not _eid:
+                    continue
+                if (_label == "laadlimiet" and not can_set_charge_limit) or (
+                    _label == "ontlaadlimiet" and not can_set_discharge_limit
+                ):
+                    _LOGGER.warning(
+                        "battery_manager: verificatie %s overgeslagen (entity range geblokkeerd)",
+                        _label,
+                    )
                     continue
                 _st = self.hass.states.get(_eid)
                 if _st is None or _st.state in ("unavailable", "unknown"):
@@ -842,6 +1432,76 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                         "(entiteit reageert niet of firmware blokkeert commando)",
                         _label, _req,
                     )
+                    # Runtime fallback: sommige firmwares accepteren de power write
+                    # alleen op de "andere" number-entiteit ondanks correcte mode.
+                    if _label == "laadlimiet" and action in ("charge", "all_on") and discharge_entity:
+                        try:
+                            alt_req = int(round(self._clamp_to_number_entity(
+                                discharge_entity, float(DEFAULT_BATTERY_MAX_CHARGE)
+                            )))
+                            if alt_req > 0:
+                                _LOGGER.warning(
+                                    "battery_manager: fallback na geweigerde laadlimiet — probeer %s = %dW",
+                                    discharge_entity,
+                                    alt_req,
+                                )
+                                await self.hass.services.async_call(
+                                    "number", "set_value",
+                                    {"entity_id": discharge_entity, "value": alt_req},
+                                    blocking=True,
+                                )
+                                await asyncio.sleep(1)
+                                alt_state = self.hass.states.get(discharge_entity)
+                                if alt_state and alt_state.state not in ("unavailable", "unknown"):
+                                    try:
+                                        alt_actual = float(alt_state.state)
+                                        if alt_actual > 0:
+                                            _LOGGER.warning(
+                                                "battery_manager: fallback geslaagd via %s — werkelijk=%.0fW",
+                                                discharge_entity,
+                                                alt_actual,
+                                            )
+                                    except (TypeError, ValueError):
+                                        pass
+                        except Exception as fallback_exc:  # noqa: BLE001
+                            _LOGGER.warning(
+                                "battery_manager: fallback write voor laden mislukt: %s",
+                                fallback_exc,
+                            )
+                    elif _label == "ontlaadlimiet" and action == "discharge" and charge_entity:
+                        try:
+                            alt_req = int(round(self._clamp_to_number_entity(
+                                charge_entity, float(DEFAULT_BATTERY_MAX_DISCHARGE)
+                            )))
+                            if alt_req > 0:
+                                _LOGGER.warning(
+                                    "battery_manager: fallback na geweigerde ontlaadlimiet — probeer %s = %dW",
+                                    charge_entity,
+                                    alt_req,
+                                )
+                                await self.hass.services.async_call(
+                                    "number", "set_value",
+                                    {"entity_id": charge_entity, "value": alt_req},
+                                    blocking=True,
+                                )
+                                await asyncio.sleep(1)
+                                alt_state = self.hass.states.get(charge_entity)
+                                if alt_state and alt_state.state not in ("unavailable", "unknown"):
+                                    try:
+                                        alt_actual = float(alt_state.state)
+                                        if alt_actual > 0:
+                                            _LOGGER.warning(
+                                                "battery_manager: fallback geslaagd via %s — werkelijk=%.0fW",
+                                                charge_entity,
+                                                alt_actual,
+                                            )
+                                    except (TypeError, ValueError):
+                                        pass
+                        except Exception as fallback_exc:  # noqa: BLE001
+                            _LOGGER.warning(
+                                "battery_manager: fallback write voor ontladen mislukt: %s",
+                                fallback_exc,
+                            )
                 elif _actual < _req * 0.9:
                     _LOGGER.warning(
                         "battery_manager: %s BEPERKT door firmware — gevraagd=%dW, werkelijk=%.0fW "
