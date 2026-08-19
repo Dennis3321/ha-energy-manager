@@ -31,27 +31,16 @@ Deze integratie bestuurt een thuisbatterij volledig prijsgestuurd. De logica is 
 
 ## Plannerlogica
 
-De planner kijkt 48 uur vooruit en bepaalt per kwartier de optimale actie:
-1. Negatieve/gratis prijs → actie `all_on` (altijd laden)
-2. Laadkwartieren: selecteer exact genoeg kwartieren om de accu vol te krijgen (puur op prijs)
-3. Arbitrage: zoek onder de resterende kwartieren naar rendabele koop/verkoop-paren (break-even formule)
-4. Ontlaadkwartieren: selecteer resterende kwartieren waarbij `prijs > break-even(koopprijs)`
-5. Chronologische check: simuleer SOC per kwartier; annuleer ontladen dat onder minimum SOC zou komen
-6. Live veiligheidscheck: als actuele SOC ≤ min_soc → ontladen geblokkeerd
+De planner plant op basis van alle beschikbare toekomstige prijzen. Zodra Tibber de prijzen voor morgen beschikbaar stelt (~13:00-14:00), plant de planner automatisch voor vandaag én morgen (tot 48 uur vooruit).
 
-### Debugging en SOC-projectie
-- De SOC-projectie (witte lijn) wordt per kwartier gesimuleerd op basis van het laadplan en de ingestelde limieten.
-- In de Home Assistant logs wordt nu per kwartier gelogd: het laadplan, de start-SOC, de limieten, en voor elk kwartier de actie en SOC-verandering.
-- Dit maakt het eenvoudig te controleren of de projectie overeenkomt met het verwachte laadgedrag.
+De planner moet plannen op basis van winst uitgedrukt in geld. Dat wil zeggen dat hij zo veel mogelijk moet laden en ontladen zolang het geld oplevert. Rekening houden met de 90% verlies. 
+
+## Regels
+1. Prijs is de enige motivatie voor laad- en ontlaadbeslissingen. Houd rekening met afschrijving en efficiëntie.
+2. Vóór een negatieve-prijsperiode moet de accu zo leeg mogelijk zijn zodat er maximaal geladen kan worden.
+3. Houd rekening met terugleverkosten.
 
 
-| Actie        | AC Mode        | Laadlimiet | Ontlaadlimiet | Wanneer                |
-|--------------|----------------|------------|---------------|-----------------------|
-| `charge`     | AC Input Mode  | 800 W      | 0 W           | Accu vullen naar MAX   |
-| `all_on`     | AC Input Mode  | 800 W      | 0 W           | Prijs ≤ €0,00          |
-| `discharge`  | AC Output Mode | 0 W        | 800 W         | Ontladen boven drempel |
-| `forced_off` | AC Input Mode  | 0 W        | 0 W           | Vakantie               |
-| `normal`     | AC Input Mode  | 0 W        | 0 W           | Standby                |
 
 
 
@@ -75,10 +64,7 @@ priceInfo(resolution: QUARTER_HOURLY) {
 - Bron: https://developer.tibber.com/docs/changelog (entry 2025-09-01)
 
 
-## Regels
-1. Prijs is de enige motivatie voor laad- en ontlaadbeslissingen. Houd rekening met afschrijving en efficiëntie.
-2. Vóór een negatieve-prijsperiode moet de accu zo leeg mogelijk zijn zodat er maximaal geladen kan worden.
-3. Houd rekening met terugleverkosten.
+
 
 
 

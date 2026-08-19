@@ -1,6 +1,6 @@
 # Battery Manager – Voortgang
 
-Laatste update: 4 april 2026
+Laatste update: 19 augustus 2026
 
 ---
 
@@ -64,6 +64,20 @@ type: custom:battery-dashboard-card
 entity: sensor.battery_manager_chart
 title: "Batterij Planning – komende 48 uur"
 ```
+
+---
+
+## Wijzigingen sessie 9 (19 augustus 2026)
+
+### Bugfix: planner plant niets meer bij lage SOC op lange horizon (`coordinator.py`)
+
+**Symptoom:** Batterij handelt al 3+ dagen niet meer — planner plant uitsluitend `normal` voor alle 192 kwartieren, ondanks winstgevende prijsverschillen (bv. kopen €0.20 → verkopen €0.38).
+
+**Oorzaak:** `_soc_sim_feasible()` simuleerde bij elke `normal`-actie een drift van `-0.05%` SOC per kwartier. Over de volledige 48-uur horizon accumuleert dit tot ~9.6% verlies. Met een startende SOC van 13% (min_soc = 10%) betekende dit dat de gesimuleerde SOC al vóór een gepland laadkwartier (morgenochtend, ~70 kwartieren verder) onder min_soc zakte. De discharge-check na dat laadkwartier faalde dan onterecht — de feasibility-check keurde elk charge+discharge-paar af, ook al was dat paar in werkelijkheid volledig haalbaar.
+
+**Fix:** De `else`-tak (standby/normal) uit `_soc_sim_feasible()` verwijderd. Standby-modus trekt de SOC niet actief omlaag in de planning; alleen expliciete `discharge`-acties tellen mee voor de min_soc-grens. `_recompute_soc_at()` (gebruikt voor de grafiek) behoudt de drift voor visuele nauwkeurigheid.
+
+**Resultaat na herstart:** `arb_pairs=14`, `est_pair_profit=€0.46` — batterij laadt morgen bij goedkopere prijzen en ontlaadt 's avonds bij dure prijzen.
 
 ---
 

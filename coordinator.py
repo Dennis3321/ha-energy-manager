@@ -179,7 +179,9 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         try:
             if min_v is not None:
                 clamped = max(clamped, float(min_v))
-            if max_v is not None:
+            # max=0 betekent dat de entiteit in de verkeerde modus staat (mode-afhankelijk
+            # bereik) — niet clampen, laat de schrijfpoging zelf de fout afhandelen.
+            if max_v is not None and float(max_v) > 0:
                 clamped = min(clamped, float(max_v))
         except (ValueError, TypeError):
             return requested
@@ -1146,12 +1148,13 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
 
             # Fallback: als mode op papier goed staat maar de target-limit nog max=0 heeft,
             # probeer alternatieve mode-opties met output/input in de naam.
-            if action == "discharge" and discharge_entity and discharge_limit == 0 and DEFAULT_BATTERY_MAX_DISCHARGE > 0:
+            # Trigger op de werkelijke entity max, niet op de geclamped limiet.
+            if action == "discharge" and discharge_entity and self._get_number_max(discharge_entity) == 0 and DEFAULT_BATTERY_MAX_DISCHARGE > 0:
                 alt = await self._try_mode_variants_for_power(mode_entity, "output", discharge_entity)
                 if alt is not None:
                     mode_option = alt
                     discharge_limit = int(round(self._clamp_to_number_entity(discharge_entity, float(DEFAULT_BATTERY_MAX_DISCHARGE))))
-            if action in ("charge", "all_on") and charge_entity and charge_limit == 0 and DEFAULT_BATTERY_MAX_CHARGE > 0:
+            if action in ("charge", "all_on") and charge_entity and self._get_number_max(charge_entity) == 0 and DEFAULT_BATTERY_MAX_CHARGE > 0:
                 alt = await self._try_mode_variants_for_power(mode_entity, "input", charge_entity)
                 if alt is not None:
                     mode_option = alt
@@ -1276,6 +1279,10 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                         if "outside valid range" in str(exc) and attempt < 2:
                             parsed_max = self._extract_max_from_range_error(exc)
                             if parsed_max is not None:
+                                if round(parsed_max) <= 0:
+                                    raise ValueError(
+                                        f"laadlimiet entiteit meldt max=0 — laden geblokkeerd door firmware: {exc}"
+                                    )
                                 charge_limit = int(max(0, min(charge_limit, round(parsed_max))))
                                 _LOGGER.warning(
                                     "battery_manager: laadlimiet range uit foutmelding afgeleid (max=%.0fW), retry %d/3",
@@ -1294,6 +1301,10 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                         if "at most" in str(exc).lower() and attempt < 2:
                             parsed_max = self._extract_max_from_range_error(exc)
                             if parsed_max is not None:
+                                if round(parsed_max) <= 0:
+                                    raise ValueError(
+                                        f"laadlimiet entiteit meldt max=0 — laden geblokkeerd door firmware: {exc}"
+                                    )
                                 charge_limit = int(max(0, min(charge_limit, round(parsed_max))))
                                 _LOGGER.warning(
                                     "battery_manager: laadlimiet maximum uit foutmelding afgeleid (max=%.0fW), retry %d/3",
@@ -1338,6 +1349,10 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                         if "outside valid range" in str(exc) and attempt < 2:
                             parsed_max = self._extract_max_from_range_error(exc)
                             if parsed_max is not None:
+                                if round(parsed_max) <= 0:
+                                    raise ValueError(
+                                        f"ontlaadlimiet entiteit meldt max=0 — ontladen geblokkeerd door firmware: {exc}"
+                                    )
                                 discharge_limit = int(max(0, min(discharge_limit, round(parsed_max))))
                                 _LOGGER.warning(
                                     "battery_manager: ontlaadlimiet range uit foutmelding afgeleid (max=%.0fW), retry %d/3",
@@ -1356,6 +1371,10 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                         if "at most" in str(exc).lower() and attempt < 2:
                             parsed_max = self._extract_max_from_range_error(exc)
                             if parsed_max is not None:
+                                if round(parsed_max) <= 0:
+                                    raise ValueError(
+                                        f"ontlaadlimiet entiteit meldt max=0 — ontladen geblokkeerd door firmware: {exc}"
+                                    )
                                 discharge_limit = int(max(0, min(discharge_limit, round(parsed_max))))
                                 _LOGGER.warning(
                                     "battery_manager: ontlaadlimiet maximum uit foutmelding afgeleid (max=%.0fW), retry %d/3",
@@ -1534,10 +1553,10 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("battery_manager: batterij-aansturing mislukt: %s", err)
 
     def _create_schedule(self, all_prices, battery_soc, p1, min_soc=DEFAULT_MIN_SOC):
-        """Dagplanner: maximaliseer euro-winst op basis van prijs, efficiëntie en afschrijving.
+        """Planner: maximaliseer euro-winst op basis van prijs, efficiëntie en afschrijving.
 
         Regels uit SPEC:
-          1. Alleen huidige dag plannen.
+          1. Plan voor alle beschikbare toekomstige prijzen (vandaag + morgen indien beschikbaar).
           2. Prijs is enige motivatie (incl. efficiëntie, afschrijving, terugleverkosten).
           3. Voor negatieve prijsperioden accu zo leeg mogelijk maken om laadruimte te creëren.
         """
@@ -1564,23 +1583,19 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             else:
                 future.append(entry)
 
-        planning_future = [
-            e for e in future
-            if e['dt'] is None or e['dt'].date() == now_dt.date()
-        ]
-        future_later = [
-            e for e in future
-            if e['dt'] is not None and e['dt'].date() != now_dt.date()
-        ]
+        # Plan voor alle beschikbare toekomstige slots (vandaag + morgen)
+        planning_future = future
 
         self._dbg(
-            "Planner horizon: vandaag=%d kwartieren, later=%d kwartieren",
-            len(planning_future), len(future_later),
+            "Planner horizon: %d toekomstige kwartieren (%d vandaag, %d morgen)",
+            len(planning_future),
+            sum(1 for e in planning_future if e['dt'] is not None and e['dt'].date() == now_dt.date()),
+            sum(1 for e in planning_future if e['dt'] is not None and e['dt'].date() != now_dt.date()),
         )
 
         if not planning_future:
             self._pending_diag = None
-            return self._build_schedule_result(past, future_later, battery_soc, min_soc)
+            return self._build_schedule_result(past, [], battery_soc, min_soc)
 
         kwh_per_quarter_charge = (DEFAULT_BATTERY_MAX_CHARGE / 1000) * 0.25 * DEFAULT_CHARGE_EFFICIENCY
         soc_per_charge_quarter = (kwh_per_quarter_charge / DEFAULT_BATTERY_CAPACITY) * 100
@@ -1589,12 +1604,12 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
         eta = DEFAULT_CHARGE_EFFICIENCY
         feed_in_cost = DEFAULT_FEED_IN_COST
 
-        prices_today = [e['price'] for e in planning_future if e['price'] is not None]
-        cheapest_today = min(prices_today) if prices_today else 0.0
+        prices_available = [e['price'] for e in planning_future if e['price'] is not None]
+        cheapest_available = min(prices_available) if prices_available else 0.0
         effective_source_price = (
             self._effective_charge_price
             if self._effective_charge_price is not None
-            else cheapest_today
+            else cheapest_available
         )
 
         def _recompute_soc_at(future_list, start_soc):
@@ -1622,8 +1637,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     s -= soc_per_discharge_quarter
                     if s < min_soc:
                         return False
-                else:
-                    s = max(0.0, s - 0.05)
+                # normal: geen drift — standby trekt SOC niet actief omlaag in de planning
             return True
 
         def _pair_profit(buy_price: float, sell_price: float) -> float:
@@ -1739,7 +1753,7 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                 f"discharge_threshold=€{discharge_threshold:.4f}  feed_in=€{feed_in_cost:.4f}  BATTERY_DEPRECIATION=€{BATTERY_DEPRECIATION:.4f}",
                 f"negative_slots={len(negative_slots)}  pre_negative_discharge={forced_pre_negative}  arb_pairs={len(arb_pairs)}  est_pair_profit={est_pair_profit:.4f}",
                 f"n_charge={n_charge}  n_discharge={n_discharge}",
-                "--- toekomstige acties vandaag (na alle correcties) ---",
+                "--- geplande acties (vandaag + morgen, na alle correcties) ---",
             ]
             for e in planning_future:
                 t = e.get('starts_at', '')
@@ -1752,24 +1766,11 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                     if e['price'] is not None else
                     f"  {t_short}  None  {e['action']}"
                 )
-            if future_later:
-                diag_lines.append("--- latere kwartieren buiten planningshorizon ---")
-                for e in future_later:
-                    t = e.get('starts_at', '')
-                    try:
-                        t_short = t[11:16]
-                    except Exception:
-                        t_short = t
-                    diag_lines.append(
-                        f"  {t_short}  €{e['price']:.4f}  {e['action']}"
-                        if e['price'] is not None else
-                        f"  {t_short}  None  {e['action']}"
-                    )
             self._pending_diag = "\n".join(diag_lines)
         except Exception:
             self._pending_diag = None
 
-        return self._build_schedule_result(past, planning_future + future_later, battery_soc, min_soc)
+        return self._build_schedule_result(past, planning_future, battery_soc, min_soc)
 
     def _build_schedule_result(self, past, future, battery_soc, min_soc):
         """Combineer past + future tot een schedule-lijst met gesimuleerde SOC."""
