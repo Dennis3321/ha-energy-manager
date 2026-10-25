@@ -166,6 +166,16 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
             return None
         return f"number.{prefix}_soc_set"
 
+    @staticmethod
+    def _guess_min_soc_entity(mode_entity: str) -> str | None:
+        """Best-effort mapping from AC mode select to Zendure SoC Minimum number entity."""
+        if not mode_entity.startswith("select.") or not mode_entity.endswith("_ac_mode"):
+            return None
+        prefix = mode_entity[len("select.") : -len("_ac_mode")]
+        if not prefix:
+            return None
+        return f"number.{prefix}_min_soc"
+
     def _clamp_to_number_entity(self, entity_id: str, requested: float) -> float:
         """Clamp a requested number value to the entity's allowed min/max."""
         st = self.hass.states.get(entity_id)
@@ -517,6 +527,25 @@ class BatteryManagerCoordinator(DataUpdateCoordinator):
                           all_prices[-1].get("startsAt", "?")[:16], all_prices[-1].get("total") or 0)
 
             min_soc = self.entry.options.get(CONF_MIN_SOC, DEFAULT_MIN_SOC)
+
+            # Sync de geconfigureerde min-SoC naar de hardware entiteit
+            hw_min_soc_entity = self._guess_min_soc_entity(config.get(CONF_BATTERY_MODE, ""))
+            if hw_min_soc_entity:
+                hw_st = self.hass.states.get(hw_min_soc_entity)
+                if hw_st and hw_st.state not in ("unavailable", "unknown", "none", ""):
+                    try:
+                        if float(hw_st.state) != float(min_soc):
+                            await self.hass.services.async_call(
+                                "number", "set_value",
+                                {"entity_id": hw_min_soc_entity, "value": min_soc},
+                                blocking=True,
+                            )
+                            _LOGGER.info(
+                                "battery_manager: hardware min-SoC gesynchroniseerd: %.0f%% → %.0f%% (%s)",
+                                float(hw_st.state), min_soc, hw_min_soc_entity,
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        _LOGGER.warning("battery_manager: hardware min-SoC sync mislukt: %s", exc)
 
             schedule = self._create_schedule(
                 all_prices, battery_soc, p1, min_soc

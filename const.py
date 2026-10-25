@@ -6,7 +6,7 @@ DEFAULT_BATTERY_MAX_CHARGE = 2400
 DEFAULT_BATTERY_MAX_DISCHARGE = 2400
 DEFAULT_BATTERY_COST = 2500
 DEFAULT_BATTERY_CYCLES = 6000   # LFP levensduur; verdubbeld t.o.v. ouder standaard
-DEFAULT_CHARGE_EFFICIENCY = 0.90
+DEFAULT_CHARGE_EFFICIENCY = 0.835  # gemeten rendement via sensor.solarflow_2400_ac_roundtrip_efficiency
 DEFAULT_MIN_SOC = 10            # Fabrikant minimum (Zendure SolarEdge 2400)
 DEFAULT_MAX_SOC = 100
 
